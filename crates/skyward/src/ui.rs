@@ -29,11 +29,14 @@ use skyward_block::usb::{self, Drive};
 use skyward_net::download::{self, Failure};
 use skyward_net::http::Servers;
 use skyward_net::release::{Installed, Release, Unanswered};
-use skyward_net::wlan::{Power as WlanPower, Wlan};
+use skyward_net::wlan::{Power as WlanPower, Stage as Joining, Wlan};
+use skyward_sys::sleep::{Sleeper, Slept};
+use skyward_sys::uevent;
 use skyward_ui::app::{
     App, Asked, BackupAt, BackupEnd, BackupEntry, BackupRefusal, ClashChoice, Data, DownloadEnd, Effect, EraseStop, FileKind, FileOp,
     FileRow, FileTask, FsAction, FsRow, Have, Held, ItemEnd, ItemState, JobEnd, Keys, MountFailure, Part, PartKind, PartStop, Place,
-    RenameRefused, Screen, Shot, Target, UsbDrive, UsbLink, Wipe, DATA_OPENING, DATA_PARTITION, DOWNLOADS, INSTALL_UNFINISHED, USB_DRIVE,
+    RenameRefused, Screen, Shot, SkywardEnd, SkywardStage, Target, UsbDrive, UsbLink, Wipe, DATA_OPENING, DATA_PARTITION, DOWNLOADS,
+    INSTALL_UNFINISHED, USB_DRIVE,
 };
 use skyward_ui::settings::Keeper;
 use skyward_ui::surface::kms::KmsSurface;
@@ -58,6 +61,11 @@ const LEAVE_AFTER_MS: u64 = 1500;
 /// How long after the screen starts a touch panel may still come up; with
 /// none by then, the pages are worked with the keys, their light shown.
 const TOUCH_WAIT: Duration = Duration::from_secs(5);
+
+/// How long a panel gone dark rests, ready to light again at once, before
+/// the display turns off; the phone's own system keeps its panel dozing
+/// about as long after the screen goes off.
+const REST: Duration = Duration::from_secs(5);
 
 /// Where logs saved to the temporary folder go, in the recovery service's
 /// own folder, and where in internal storage the others do.
@@ -245,15 +253,31 @@ fn withhold(transfer: &mut Option<Transfer>, app: &mut App, now: u64) -> Result<
 /// computer has the port, as the USB controller tells it.
 fn fastboot_status() -> Result<(bool, UsbLink)> {
     let running = skyward_sys::prop("init.svc.fastbootd").as_deref() == Some("running");
+    Ok((running, usb_link()?))
+}
+
+/// Light the panel, as on a cable going in or out, when the battery as it
+/// `was` and as it `is` disagree on whether a charger or a computer powers
+/// the phone.
+fn plug(app: &mut App, was: &Option<skyward_info::Battery>, is: &Option<skyward_info::Battery>, now: u64) -> Result<()> {
+    let plugged = |b: &Option<skyward_info::Battery>| b.as_ref().is_some_and(|b| b.plugged);
+    if plugged(was) != plugged(is) {
+        skyward_sys::kmsg(if plugged(is) { "a charger or a computer powers the phone" } else { "the phone runs on its battery" })?;
+        app.plugged(now, plugged(is));
+    }
+    Ok(())
+}
+
+/// How far a computer has the USB port, as the port's controller tells.
+fn usb_link() -> Result<UsbLink> {
     let controller = skyward_sys::prop("sys.usb.controller").context("init names no USB controller")?;
     let path = Path::new("/sys/class/udc").join(controller).join("state");
     let state = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    let link = match state.trim() {
+    Ok(match state.trim() {
         "configured" => UsbLink::Connected,
         "not attached" => UsbLink::Unplugged,
         _ => UsbLink::Connecting,
-    };
-    Ok((running, link))
+    })
 }
 
 /// What a request from misc shows on the pages that answer it.
@@ -1101,6 +1125,8 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     // Whether the panel's frame memory has been blacked out for an off
     // panel; cleared once a real frame is shown again.
     let mut blanked = false;
+    // When the panel gone dark began to rest.
+    let mut rested_at: Option<Instant> = None;
     // Started for fastboot, the port goes to the phone's own fastbootd. The
     // page says whether it came up and how far a computer has the port;
     // why it did not come up goes to the kernel log and on screen.
@@ -1272,6 +1298,15 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     // Asking the update server, and downloading the full package.
     let mut checker: Option<updates::Worker> = None;
     let mut downloader: Option<updates::Worker> = None;
+    // Asking GitHub for Skyward's newest release, and updating to it.
+    let mut skyward_checker: Option<updates::Worker> = None;
+    let mut skyward_updater: Option<updates::Worker> = None;
+    // The phone sleeps while its screen is off and nothing needs it awake.
+    let sleeper = Sleeper::start()?;
+    // A uevent may be a charger or a computer attached or taken away: the
+    // battery is read at once, and the phone stays awake until it is.
+    let uevents = uevent::Listener::open()?;
+    let mut asked: Option<Instant> = None;
     // The USB drive plugged in, looked for each second.
     let mut plugged: Option<Plugged> = None;
     let mut seen: Option<String> = None;
@@ -1296,7 +1331,14 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         h.click(app.state.vibration)?;
                     }
                 }
-                other => unreachable!("time passing asks for nothing but a tap of the motor, not {other:?}"),
+                // The power key held past its wait for volume down turns
+                // the screen off.
+                Effect::Ticks => {
+                    if let Some(h) = &mut haptics {
+                        h.ticks()?;
+                    }
+                }
+                other => unreachable!("time passing asks for nothing but the motor, not {other:?}"),
             }
         }
         let time = clock(app.state.time_zone)?;
@@ -1306,16 +1348,24 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         }
         for reading in readings.taken() {
             match reading {
-                Reading::Battery(battery) => {
+                Reading::Battery(battery, at) => {
                     let battery = battery?;
+                    if asked.is_some_and(|asked| at >= asked) {
+                        asked = None;
+                    }
                     if battery != info.battery {
+                        plug(&mut app, &info.battery, &battery, now)?;
                         info.battery = battery;
                         app.refresh();
                     }
                 }
                 Reading::All(all, at) => {
                     let all = (*all)?;
+                    if asked.is_some_and(|asked| at >= asked) {
+                        asked = None;
+                    }
                     if at >= read_at && all != info {
+                        plug(&mut app, &info.battery, &all.battery, now)?;
                         info = all;
                         app.refresh();
                     }
@@ -1331,7 +1381,8 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         let panel = app.panel(now);
         let mut shown = false;
         if panel.is_some() {
-            if app.take_dirty() {
+            // A display turned off comes on again with a frame drawn for it.
+            if app.take_dirty() || !surface.is_on() {
                 let t0 = Instant::now();
                 app.compose(&mut screen, &fonts, &info, &shown_clock, now);
                 surface.present(&screen)?;
@@ -1344,8 +1395,8 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             blanked = false;
         } else if !blanked {
             // Black out the panel's frame memory before the backlight goes
-            // to 0, so an OLED that floors the backlight above zero rather
-            // than cutting it shows nothing and cannot burn in.
+            // to 0 and the display off, so an OLED that floors the backlight
+            // above zero rather than cutting it shows nothing as it goes off.
             screen.data.fill(0);
             surface.present(&screen)?;
             surface.settle()?;
@@ -1358,6 +1409,22 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             surface.settle()?;
         }
         backlight.show(panel)?;
+        if panel.is_some() {
+            // Lit, a panel that came on again switches to its fastest
+            // refresh.
+            surface.speed_up()?;
+            rested_at = None;
+        } else if surface.is_on() {
+            // With the backlight off, the panel rests, and the touch
+            // controller following it stops drawing power.
+            surface.rest()?;
+            rested_at = Some(Instant::now());
+        } else if rested_at.is_some_and(|at| at.elapsed() >= REST) {
+            // Rested long enough, the display goes off: the panel and the
+            // display processor feeding it stop drawing power.
+            surface.turn_off()?;
+            rested_at = None;
+        }
         // A page at rest draws the rows it has yet to while nothing else
         // is to be done, a band at a time, looking for input between bands.
         let ahead = panel.is_some() && !shown && app.draw_ahead(&fonts, &info);
@@ -1366,8 +1433,42 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         // gets at least a millisecond.
         let floor = if shown { 0 } else { 1 };
         let until_due = app.deadline(now).map(|d| d.saturating_sub(now) as i32);
-        let timeout = if ahead { 0 } else { until_due.map_or(1000, |t| t.clamp(floor, 1000)) };
-        let mut fds = inputs.fds();
+        // A resting panel turns off once its rest is over.
+        let rest_left = rested_at.map(|at| REST.saturating_sub(at.elapsed()).as_millis() as i32);
+        let timeout = if ahead { 0 } else { until_due.into_iter().chain(rest_left).min().map_or(1000, |t| t.clamp(floor, 1000)) };
+        // With the display off, the phone sleeps unless something needs it
+        // awake: work under way, fastboot or sideload, a restart on its way,
+        // a command running in the terminal, a network being joined, the
+        // battery read after a uevent, or a computer on the USB port, whose
+        // adb and file transfer stay up.
+        let busy = installer.is_some()
+            || eraser.is_some()
+            || worker.is_some()
+            || relabeler.is_some()
+            || backuper.is_some()
+            || merger.is_some()
+            || decryptor.is_some()
+            || part_worker.is_some()
+            || checker.is_some()
+            || downloader.is_some()
+            || skyward_checker.is_some()
+            || skyward_updater.is_some();
+        let joining = app.state.wlan.as_ref().and_then(|w| w.joined.as_ref()).is_some_and(|j| matches!(j.stage, Joining::Joining | Joining::Addressing));
+        let running = match &shell {
+            Some(sh) => !sh.waiting()?,
+            None => false,
+        };
+        let may_sleep = surface.is_off()
+            && !busy
+            && !fastboot
+            && !sideloading
+            && leave_at.is_none()
+            && !joining
+            && !running
+            && asked.is_none()
+            && usb_link()? != UsbLink::Connected;
+        sleeper.allow(may_sleep);
+        let mut fds = vec![inputs.fd(), uevents.fd(), sleeper.fd()];
         if let Some(i) = &installer {
             fds.push(i.fd());
         }
@@ -1407,9 +1508,25 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         if let Some(d) = &downloader {
             fds.push(d.fd());
         }
+        if let Some(c) = &skyward_checker {
+            fds.push(c.fd());
+        }
+        if let Some(u) = &skyward_updater {
+            fds.push(u.fd());
+        }
         fds.push(readings.fd());
         wait(&fds, timeout)?;
         let now = monotonic_ms();
+        for slept in sleeper.slept() {
+            match slept {
+                Slept::Woke => skyward_sys::kmsg("the phone slept and woke")?,
+                Slept::Refused(why) => skyward_sys::kmsg(&format!("the phone did not sleep: {why}"))?,
+            }
+        }
+        if uevents.heard()? {
+            readings.ask();
+            asked = Some(Instant::now());
+        }
         let mut drive_told = None;
         if drive_at.elapsed().as_secs() >= 1 {
             drive_told = look_for_drive(&mut plugged, &mut seen)?;
@@ -1738,17 +1855,60 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                             updates::End::Downloaded => DownloadEnd::Downloaded,
                             updates::End::Stopped => DownloadEnd::Stopped,
                             updates::End::Failed(why) => DownloadEnd::Failed(why),
+                            updates::End::Updated(_) | updates::End::NotWritten(_) | updates::End::WriteFailed(..) => {
+                                unreachable!("a system's full package is only downloaded")
+                            }
                         };
                         skyward_sys::kmsg(&format!("downloading {} ended: {end:?}", release.name))?;
                         app.download_ended(end, have(&app, &release), now);
                         fetched = true;
                     }
-                    updates::Event::Checked(_) => unreachable!("a download asks nothing of its own"),
+                    updates::Event::Checked(_) | updates::Event::SkywardChecked(_) | updates::Event::Writing { .. } => {
+                        unreachable!("a download asks nothing of its own, and writes nothing")
+                    }
                 }
             }
         }
         if fetched {
             downloader = None;
+        }
+        let mut asked = false;
+        if let Some(c) = &skyward_checker {
+            for ev in c.events() {
+                let updates::Event::SkywardChecked(answer) = ev else { unreachable!("asking GitHub downloads nothing") };
+                skyward_sys::kmsg(&format!("GitHub told of Skyward's newest release: {answer:?}"))?;
+                app.skyward_checked(answer);
+                asked = true;
+            }
+        }
+        if asked {
+            skyward_checker = None;
+        }
+        let mut updated = false;
+        if let Some(u) = &skyward_updater {
+            for ev in u.events() {
+                match ev {
+                    updates::Event::Progress(progress, rate) => app.skyward_progress(SkywardStage::Download(progress), rate),
+                    updates::Event::Writing { done, total } => app.skyward_progress(SkywardStage::Write { done, total }, 0),
+                    updates::Event::Ended(end) => {
+                        let end = match end {
+                            updates::End::Updated(slots) => SkywardEnd::Updated(slots),
+                            updates::End::Stopped => SkywardEnd::Stopped,
+                            updates::End::Failed(why) => SkywardEnd::Download(why),
+                            updates::End::NotWritten(why) => SkywardEnd::NotWritten(why),
+                            updates::End::WriteFailed(slots, why) => SkywardEnd::WriteFailed(slots, why),
+                            updates::End::Downloaded => unreachable!("Skyward's build is written once it is downloaded"),
+                        };
+                        skyward_sys::kmsg(&format!("updating Skyward ended: {end:?}"))?;
+                        app.skyward_ended(end, now);
+                        updated = true;
+                    }
+                    updates::Event::Checked(_) | updates::Event::SkywardChecked(_) => unreachable!("an update asks nothing of its own"),
+                }
+            }
+        }
+        if updated {
+            skyward_updater = None;
         }
         if let Some(ended) = decryptor.as_ref().and_then(Decryptor::ended) {
             decryptor = None;
@@ -1935,6 +2095,11 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     Effect::Haptic => {
                         if let Some(h) = &mut haptics {
                             h.click(app.state.vibration)?;
+                        }
+                    }
+                    Effect::Ticks => {
+                        if let Some(h) = &mut haptics {
+                            h.ticks()?;
                         }
                     }
                     // The panel shows the last frame drawn, which is what is
@@ -2198,6 +2363,24 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         }
                     }
                     Effect::StopDownload => downloader.as_ref().context("there is no download to stop")?.stop(),
+                    Effect::CheckSkyward => {
+                        ensure!(skyward_checker.is_none(), "GitHub is being asked already");
+                        let probe = cfg.wlan.as_ref().context("the phone's WLAN is not brought up")?.probe.clone();
+                        let task = updates::Task::CheckSkyward { probe, codename: cfg.device.codename.clone() };
+                        skyward_checker = Some(updates::Worker::start(task, servers.clone())?);
+                    }
+                    // The zip goes into the recovery's own folder, which is
+                    // in memory, before its image goes into the recovery
+                    // partitions.
+                    Effect::UpdateSkyward(build) => {
+                        ensure!(skyward_updater.is_none(), "Skyward is being updated already");
+                        ensure!(installer.is_none(), "an installer is running already");
+                        skyward_sys::kmsg(&format!("updating Skyward to {}", build.name))?;
+                        let path = Path::new(skyward_sys::RUN).join(&build.name);
+                        let task = updates::Task::UpdateSkyward { build, codename: cfg.device.codename.clone(), path };
+                        skyward_updater = Some(updates::Worker::start(task, servers.clone())?);
+                    }
+                    Effect::StopSkywardUpdate => skyward_updater.as_ref().context("Skyward is not being updated")?.stop(),
                     // Logs that cannot be saved are the page's to report;
                     // the recovery carries on.
                     Effect::ExportLogs { recovery, kernel, storage } => {
