@@ -1050,12 +1050,15 @@ fn read_avb(cfg: &DeviceConfig) -> Result<AvbStatus, String> {
     read().map_err(|e| format!("{e:#}"))
 }
 
-fn disable_avb(cfg: &DeviceConfig, checks: avb::Checks) -> Result<AvbStatus, String> {
+fn disable_avb(cfg: &DeviceConfig) -> Result<AvbStatus, String> {
     let disable = || -> Result<AvbStatus> {
         ensure!(avb_unlocked()?, "the bootloader is locked or its unlock state is unknown");
         let update = skyward_vab::snapshot_state()?;
         ensure!(update == skyward_vab::SnapshotState::None, "an update is in flight or its state is unknown ({update:?})");
-        let partitions = avb::disable(Path::new(skyward_block::BY_NAME), avb_suffixes(cfg), checks)?;
+        // The referenced device tree does not enable ALL_DISABLED.
+        // Its manual action changes verity alone. Changing boot
+        // verification has not been validated on dada.
+        let partitions = avb::disable(Path::new(skyward_block::BY_NAME), avb_suffixes(cfg), avb::Checks::default())?;
         let _ = skyward_sys::kmsg("the selected vbmeta checks are disabled; reboot for them to take effect");
         Ok(AvbStatus { unlocked: true, partitions })
     };
@@ -2376,8 +2379,8 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     Effect::ReadSlots => app.set_boot_slots(read_slots()),
                     Effect::SetSlot(slot) => app.slot_switched(set_slot(slot), now),
                     Effect::ReadAvb => app.set_avb(read_avb(cfg)),
-                    Effect::DisableAvb(checks) => {
-                        let result = disable_avb(cfg, checks);
+                    Effect::DisableAvb => {
+                        let result = disable_avb(cfg);
                         if result.is_err() {
                             app.set_avb(read_avb(cfg));
                         }

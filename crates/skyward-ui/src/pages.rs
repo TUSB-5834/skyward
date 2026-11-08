@@ -2214,7 +2214,8 @@ pub fn advanced(cx: &Ctx) -> Frame {
 const RELABEL: Text = ["修复 SELinux 上下文", "修復 SELinux 上下文", "Fix SELinux contexts"];
 const DISABLE_AVB: Text = ["禁用 AVB", "停用 AVB", "Disable AVB"];
 
-/// TWRP's manual AVB action: show every target, choose the checks, then swipe.
+/// TWRP's default manual AVB action disables dm-verity alone. Boot
+/// verification remains as read; changing it is not supported by this page.
 pub fn avb(cx: &Ctx) -> Frame {
     let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
     let mut c = long_page(cx);
@@ -2238,25 +2239,15 @@ pub fn avb(cx: &Ctx) -> Frame {
     let rows: Vec<Row> = status.partitions.iter().zip(&descriptions).map(|(p, d)| Row::new(&p.partition).subtitle(d).trail(Trail::None)).collect();
     let y = widgets::section_first(&mut c, t, f, top, l.pick(["目标分区", "目標分割區", "Target partitions"]));
     let partitions = widgets::list(&mut c, t, f, y, &rows);
-    let y = widgets::section(&mut c, t, f, partitions.bottom, l.pick(["要禁用的验证", "要停用的驗證", "Checks to disable"]));
-    let choices = widgets::list(&mut c, t, f, y, &[
-        Row::new(l.pick(["禁用 dm-verity", "停用 dm-verity", "Disable dm-verity"]))
-            .subtitle(l.pick(["停止检查系统分区的数据块", "停止檢查系統分割區的資料區塊", "Stops checking system partition data blocks"]))
-            .trail(Trail::Switch(s.avb_checks.verity)),
-        Row::new(l.pick(["禁用启动验证", "停用啟動驗證", "Disable boot verification"]))
-            .subtitle(l.pick(["跳过 Bootloader 的分区验证", "略過 Bootloader 的分割區驗證", "Skips the bootloader's partition verification"]))
-            .trail(Trail::Switch(s.avb_checks.verification)),
-    ]);
-    out.extend(hits(&choices.rows, &[Action::AvbCheck(true), Action::AvbCheck(false)]));
     let note = l.pick([
-        "修改上列分区的验证标记，重启后生效。A/B 设备会处理两个槽位；完整系统更新可能恢复验证。",
-        "修改上列分割區的驗證標記，重新啟動後生效。A/B 裝置會處理兩個槽位；完整系統更新可能恢復驗證。",
-        "Changes the listed partitions' verification flags, effective after reboot. Both slots are handled on A/B devices; a full system update may restore verification.",
+        "按参考 TWRP 的默认方式，仅禁用 dm-verity，不修改启动验证标记。A/B 设备会处理两个槽位，重启后生效；完整系统更新可能恢复验证。",
+        "依照參考 TWRP 的預設方式，僅停用 dm-verity，不修改啟動驗證標記。A/B 裝置會處理兩個槽位，重新啟動後生效；完整系統更新可能恢復驗證。",
+        "Matches the referenced TWRP default: disables dm-verity only and leaves boot verification flags unchanged. Both A/B slots are handled, effective after reboot; a full system update may restore verity.",
     ]);
-    let mut y = widgets::footnote(&mut c, t, f, choices.bottom, note);
+    let mut y = widgets::footnote(&mut c, t, f, partitions.bottom, note);
     if let Some(result) = &s.avb_result {
         let message = match result {
-            Ok(()) => l.pick(["所选验证已禁用，重启后生效。", "所選驗證已停用，重新啟動後生效。", "Selected checks disabled; reboot for them to take effect."]).to_string(),
+            Ok(()) => l.pick(["dm-verity 已禁用，重启后生效。", "dm-verity 已停用，重新啟動後生效。", "dm-verity disabled; reboot for it to take effect."]).to_string(),
             Err(why) => tr!(l, "禁用失败：{why}", "停用失敗：{why}", "Couldn't disable: {why}"),
         };
         y = widgets::footnote(&mut c, t, f, y, &message);
@@ -2270,13 +2261,12 @@ pub fn avb(cx: &Ctx) -> Frame {
     };
     if let Some(why) = blocked {
         widgets::footnote(&mut c, t, f, y, &why);
-    } else if s.avb_checks.mask() != 0 && status.partitions.iter().any(|p| p.flags & s.avb_checks.mask() != s.avb_checks.mask()) {
+    } else if status.partitions.iter().any(|p| p.verity_enabled()) {
         let (label, danger) = confirm_label(Confirm::DisableAvb, s);
         let track = widgets::confirm(&mut c, t, f, y + t.m.dp(24.0), label, danger, s.confirm);
         out.push(Hit { rect: track, action: Action::Confirm(Confirm::DisableAvb) });
     } else {
-        let note = if s.avb_checks.mask() == 0 { ["请选择要禁用的验证。", "請選擇要停用的驗證。", "Choose the checks to disable."] } else { ["所选验证已禁用。", "所選驗證已停用。", "Selected checks are already disabled."] };
-        widgets::footnote(&mut c, t, f, y, l.pick(note));
+        widgets::footnote(&mut c, t, f, y, l.pick(["dm-verity 已禁用。", "dm-verity 已停用。", "dm-verity is already disabled."]));
     }
     Frame::new(t, c, out, title, top)
 }

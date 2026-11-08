@@ -21,7 +21,7 @@ use crate::tr;
 use crate::widgets::{self, Bar, Bolt, Cap, Layer, WlanMark};
 use skyward_info::DeviceInfo;
 use skyward_install::{Event, ImageKind, Outcome, Reflash, Refusal, Stage};
-use skyward_install::avb::{Checks as AvbChecks, State as AvbPartition};
+use skyward_install::avb::State as AvbPartition;
 use skyward_net::download::{Failure, Progress};
 use skyward_net::github::{Build, Newest};
 use skyward_net::release::{Release, Unanswered};
@@ -62,7 +62,7 @@ pub enum Screen {
     BackupJob,
     /// Tools for the experienced: files, a terminal, the logs.
     Advanced,
-    /// The top-level vbmeta checks and a swipe to disable the chosen ones.
+    /// The top-level vbmeta checks and a swipe to disable dm-verity.
     Avb,
     Files,
     /// One file, and what can be done with it.
@@ -1186,8 +1186,6 @@ pub enum Action {
     ExportLogs,
     /// Pick this slot to start next; a swipe then switches to it.
     PickSlot(Slot),
-    /// Toggle verity (`true`) or boot verification (`false`) on the AVB page.
-    AvbCheck(bool),
     /// A key of the on-screen keyboard.
     Type(Cap),
     /// A key of the row above the keyboard, the terminal's or the editor's.
@@ -1628,7 +1626,6 @@ pub struct State {
     /// the page shows the one the boot control starts next.
     pub next_slot: Option<Slot>,
     pub avb: Option<Result<AvbStatus, String>>,
-    pub avb_checks: AvbChecks,
     pub avb_result: Option<Result<(), String>>,
     /// Where the data partition stands, and what is typed at the screen
     /// lock its users' own files wait on.
@@ -1768,7 +1765,6 @@ impl Default for State {
             boot_slots: None,
             next_slot: None,
             avb: None,
-            avb_checks: AvbChecks::default(),
             avb_result: None,
             data: Data::Closed,
             code: String::new(),
@@ -1961,7 +1957,7 @@ pub enum Effect {
     /// [`App::slot_switched`].
     SetSlot(Slot),
     ReadAvb,
-    DisableAvb(AvbChecks),
+    DisableAvb,
     /// Mount the slot's partition with this base name, such as `system`.
     Mount(String),
     /// Unmount the slot's partition with this base name.
@@ -5359,12 +5355,6 @@ impl App {
                 self.state.next_slot = Some(slot);
                 self.refresh();
             }
-            Action::AvbCheck(verity) => {
-                let chosen = if verity { &mut self.state.avb_checks.verity } else { &mut self.state.avb_checks.verification };
-                *chosen = !*chosen;
-                self.state.avb_result = None;
-                self.refresh();
-            }
             Action::Type(cap) if self.screen() == Screen::Terminal => return self.term_typed(cap),
             Action::Type(cap) if self.screen() == Screen::Editor => self.edit_typed(cap),
             Action::Type(cap) => return self.type_key(cap, now),
@@ -6460,11 +6450,8 @@ impl App {
                 _ => self.say(l.pick(["无法读取启动槽位", "無法讀取啟動槽位", "Couldn't read the boot slots"]), now),
             },
             Confirm::DisableAvb => {
-                let checks = self.state.avb_checks;
-                if checks.mask() == 0 {
-                    self.say(l.pick(["请选择要禁用的验证", "請選擇要停用的驗證", "Choose the checks to disable"]), now);
-                } else if self.state.avb.as_ref().is_some_and(|s| s.as_ref().is_ok_and(|s| s.unlocked)) {
-                    fx.push(Effect::DisableAvb(checks));
+                if self.state.avb.as_ref().is_some_and(|s| s.as_ref().is_ok_and(|s| s.unlocked)) {
+                    fx.push(Effect::DisableAvb);
                 } else {
                     self.say(l.pick(["无法禁用，请确认 Bootloader 已解锁且 AVB 状态可读取", "無法停用，請確認 Bootloader 已解鎖且 AVB 狀態可讀取", "An unlocked bootloader and readable AVB state are required"]), now);
                 }
