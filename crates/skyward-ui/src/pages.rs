@@ -2240,7 +2240,7 @@ pub fn avb(cx: &Ctx) -> Frame {
     let partitions = widgets::list(&mut c, t, f, y, &rows);
     let y = widgets::section(&mut c, t, f, partitions.bottom, l.pick(["操作", "操作", "Action"]));
     let choices = widgets::list(&mut c, t, f, y, &[
-        Row::new(l.pick(if s.avb_disable_verity {
+        Row::new(l.pick(if !s.avb_disable_verity {
             ["禁用 dm-verity", "停用 dm-verity", "Disable dm-verity"]
         } else {
             ["启用 dm-verity", "啟用 dm-verity", "Enable dm-verity"]
