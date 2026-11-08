@@ -27,6 +27,7 @@ use skyward_net::github::{Build, Newest};
 use skyward_net::release::{Release, Unanswered};
 use skyward_net::supplicant::Security;
 use skyward_net::wlan::{Joined, Network, Power, Stage as Joining, Traffic, Wlan};
+use skyward_systems::{Overview, Who};
 use skyward_vab::{BootSlots, Hold, Slot, SnapshotState, Standing};
 
 /// The pages of the recovery.
@@ -102,6 +103,9 @@ pub enum Screen {
     FontLicense,
     /// Which slot the phone starts from next.
     Slot,
+    /// The installed system and the one Skyward installed beside it: which
+    /// of them starts, switching between them, and taking the other away.
+    Systems,
     /// The phone's own fastbootd serving the computer's fastboot, and where
     /// to go from it. Its only page, worked with the keys: the partitions
     /// the touchscreen runs from are left out while fastbootd rewrites
@@ -873,6 +877,13 @@ pub enum Confirm {
     Relabel,
     /// Do to the partition the filesystem page shows what it chose.
     Filesystem,
+    /// Switch to the system picked on the systems page, and restart into
+    /// it.
+    SwitchSystem,
+    /// Take the other system away.
+    RemoveSystem,
+    /// Install the system the installer holds with the room chosen.
+    InstallSystem,
 }
 
 /// What the wipe page erases: everything a factory reset erases, or any of
@@ -1021,6 +1032,11 @@ pub enum Install {
     Flashing { partition: &'static str, stage: Option<Stage> },
     /// A zip with an install script waits for the user to agree to run it.
     ConfirmingScript,
+    /// A system to install beside the installed one waits for the room its
+    /// root takes to be chosen.
+    SystemChoosing(SystemChoice),
+    /// The system is being installed: its name, and how far.
+    Systeming { name: String, stage: Option<Stage> },
     /// Its install script is made ready and then, once `running`, runs; how
     /// far it says it is, once it says.
     Scripting { stage: Option<Stage>, running: bool },
@@ -1057,6 +1073,37 @@ pub struct Choice {
     /// Which of them is chosen.
     pub partition: usize,
     pub pick: Pick,
+}
+
+/// A system to install beside the installed one, and the room its root
+/// takes so far.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SystemChoice {
+    pub name: String,
+    pub version: String,
+    /// The sizes there is room for, the least first.
+    pub sizes: Vec<u64>,
+    /// Which of them is chosen.
+    pub size: usize,
+}
+
+/// The system that starts, as the runtime last read the systems.
+pub fn starting(systems: &Overview) -> Who {
+    if systems.other_starts {
+        Who::Other
+    } else {
+        Who::Installed
+    }
+}
+
+/// Work on the systems the runtime carries out for the systems page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SystemsWork {
+    /// Writing this system's boot set into the boot partitions; the phone
+    /// restarts into it once that is done.
+    Switching(Who),
+    /// Taking the other system away.
+    Removing,
 }
 
 /// Where the reboot page sends the device, in the order it lists them.
@@ -1188,6 +1235,11 @@ pub enum Action {
     PickSlot(Slot),
     /// Select whether dm-verity is disabled; a swipe applies the change.
     ToggleAvbVerity,
+    /// Pick this system to start next; a swipe then switches to it.
+    PickSystem(Who),
+    /// Give the root of the system being installed the size at this place
+    /// in those offered.
+    SystemSize(usize),
     /// A key of the on-screen keyboard.
     Type(Cap),
     /// A key of the row above the keyboard, the terminal's or the editor's.
@@ -1630,6 +1682,21 @@ pub struct State {
     pub avb: Option<Result<AvbStatus, String>>,
     pub avb_disable_verity: bool,
     pub avb_result: Option<Result<(), String>>,
+    /// The phone has what a second system needs: boot and init_boot
+    /// partitions in both slots, which a switch writes, and recovery
+    /// partitions apart from them, which keep Skyward through it.
+    pub dual_boot: bool,
+    /// The systems, as the runtime last read them, or why it could not;
+    /// none until it has.
+    pub systems: Option<Result<Overview, String>>,
+    /// The system picked on the systems page to start next; with none
+    /// picked, the page shows the one that starts.
+    pub system_pick: Option<Who>,
+    /// Work on the systems under way.
+    pub systems_work: Option<SystemsWork>,
+    /// Why the second system's start stopped, as its first program told
+    /// it, which the systems page shows.
+    pub system_notice: Option<String>,
     /// Where the data partition stands, and what is typed at the screen
     /// lock its users' own files wait on.
     pub data: Data,
@@ -1770,6 +1837,11 @@ impl Default for State {
             avb: None,
             avb_disable_verity: false,
             avb_result: None,
+            dual_boot: false,
+            systems: None,
+            system_pick: None,
+            systems_work: None,
+            system_notice: None,
             data: Data::Closed,
             code: String::new(),
             others: Vec::new(),
@@ -1890,6 +1962,7 @@ impl State {
         match screen {
             Screen::Wlan => self.wlan.is_some(),
             Screen::SkywardUpdate => self.wlan.is_some() && self.recovery_partitions,
+            Screen::Systems => self.dual_boot,
             _ => true,
         }
     }
@@ -1901,6 +1974,37 @@ pub enum Touch {
     Down(f32, f32),
     Move(f32, f32),
     Up,
+}
+
+/// A tap on the dark panel, as the touchscreen reports it while nothing else
+/// is to be done with the finger: the phone's own system lights its screen
+/// on two of them, so the recovery does too.
+///
+/// A tap is not a touch: what is counted here is only what a finger does to
+/// a panel that is off, so the gesture that lights the panel works nothing
+/// on the page under it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tap {
+    /// Where the finger came down, in the same units as [`Touch`].
+    pub x: f32,
+    pub y: f32,
+}
+
+impl Tap {
+    /// How long after a tap another may come and still be the second of a
+    /// double tap: Android's own window.
+    pub const WINDOW_MS: u64 = 300;
+    /// How far apart two taps of one double tap may land, as a share of the
+    /// screen's width: the slop the phone's own system uses. A tap is in
+    /// screen pixels, so this is measured against the width the pages are
+    /// laid out in.
+    pub const SLOP: f32 = 0.08;
+    /// Whether `other` lands near enough to be the second tap of one double
+    /// tap started by this, on a screen `w` pixels wide.
+    pub fn doubles(&self, other: &Tap, w: f32) -> bool {
+        let slop = Self::SLOP * w;
+        (other.x - self.x).abs() <= slop && (other.y - self.y).abs() <= slop
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1962,6 +2066,18 @@ pub enum Effect {
     SetSlot(Slot),
     ReadAvb,
     SetAvbVerity { disabled: bool },
+    /// Read the systems for the systems page, telling them with
+    /// [`App::set_systems`].
+    ReadSystems,
+    /// Write this system's boot set into the boot partitions and restart
+    /// into it, telling of a switch that did not go with
+    /// [`App::systems_work_failed`].
+    SwitchSystem(Who),
+    /// Take the other system away, telling how it went with
+    /// [`App::set_systems`] or [`App::systems_work_failed`].
+    RemoveSystem,
+    /// Install the system the installer holds with a root of `size` bytes.
+    InstallSystem { size: u64 },
     /// Mount the slot's partition with this base name, such as `system`.
     Mount(String),
     /// Unmount the slot's partition with this base name.
@@ -2656,6 +2772,9 @@ pub struct App {
     /// When the panel last lit from dark, for the brief guard that keeps a
     /// stray touch or key from acting on a page just put up.
     woke_at: Option<u64>,
+    /// The last tap on a dark panel and when it came, for the second tap of
+    /// a double tap to find.
+    tapped: Option<(Tap, u64)>,
     /// The panel at full brightness, or easing to the dim level it takes
     /// shortly before going off.
     bright: Fade,
@@ -2753,6 +2872,7 @@ impl App {
             display_on: true,
             active: None,
             woke_at: None,
+            tapped: None,
             bright: full_brightness(),
             curtain: Fade::shown(BRIGHTEN, DARKEN),
             darkening: None,
@@ -3122,7 +3242,22 @@ impl App {
             self.curtain.set(true, now);
         }
         self.woke_at = Some(now);
+        self.tapped = None;
         self.stir(now);
+    }
+
+    /// A finger came down on the dark panel: the second of two taps that land
+    /// near each other, soon enough, lights it, as the phone's own double tap
+    /// does. One that comes later than the window is a tap of its own and
+    /// starts the count again.
+    fn tap(&mut self, now: u64, x: f32, y: f32) {
+        let tap = Tap { x, y };
+        let doubled =
+            self.tapped.filter(|(first, at)| now.saturating_sub(*at) <= Tap::WINDOW_MS && first.doubles(&tap, self.w as f32));
+        match doubled {
+            Some(_) => self.wake(now),
+            None => self.tapped = Some((tap, now)),
+        }
     }
 
     /// A charger or a computer was attached, `cable_in`, or taken away: the
@@ -3910,6 +4045,40 @@ impl App {
             }
             Err(why) => self.say(&tr!(self.state.lang, "切换失败：{why}", "切換失敗：{why}", "Couldn't switch: {why}"), now),
         }
+    }
+
+    /// The systems, as the runtime read them, or why it could not; work on
+    /// them that was under way has ended.
+    pub fn set_systems(&mut self, systems: Result<Overview, String>) {
+        self.state.systems = Some(systems);
+        self.state.systems_work = None;
+        self.refresh();
+    }
+
+    /// Why the work on the systems the page asked for did not go: the
+    /// switch did not happen, or the other system was not taken away.
+    pub fn systems_work_failed(&mut self, why: &str, now: u64) {
+        let l = self.state.lang;
+        let said = match self.state.systems_work.take() {
+            Some(SystemsWork::Removing) => tr!(l, "删除失败：{why}", "刪除失敗：{why}", "Couldn't remove: {why}"),
+            _ => tr!(l, "切换失败：{why}", "切換失敗：{why}", "Couldn't switch: {why}"),
+        };
+        self.say(&said, now);
+        self.refresh();
+    }
+
+    /// The second system's start stopped, for `why`, as its first program
+    /// told it: the systems page shows it, over the home page.
+    pub fn system_stopped(&mut self, why: String) {
+        self.state.system_notice = Some(why);
+        self.open(Screen::Systems);
+    }
+
+    /// A switch to `to` a system asked for before the recovery started is
+    /// under way: the systems page shows it, over the home page.
+    pub fn switch_asked(&mut self, to: Who) {
+        self.state.systems_work = Some(SystemsWork::Switching(to));
+        self.open(Screen::Systems);
     }
 
     /// What was found in the places looked in for backups: the newest
@@ -4792,11 +4961,12 @@ impl App {
                 !e.changed || self.unsaved_warned.is_some_and(|at| now < at + TOAST_MS)
             }),
             Screen::WlanAdd => !self.state.adding.as_ref().is_some_and(|a| a.choosing),
-            Screen::FileJob => !self.state.job.as_ref().is_some_and(|j| j.outcome.is_none()),
-            Screen::Relabel => !self.state.relabel.as_ref().is_some_and(|j| j.outcome.is_none()),
-            Screen::PartWork => !self.state.part_work.as_ref().is_some_and(|j| j.outcome.is_none()),
-            Screen::SkywardUpdate => !self.state.skyward_job.as_ref().is_some_and(|j| j.outcome.is_none()),
-            Screen::BackupJob => !self.state.backup_job.as_ref().is_some_and(|j| j.outcome.is_none()),
+            Screen::FileJob => self.state.job.as_ref().is_none_or(|j| j.outcome.is_some()),
+            Screen::Relabel => self.state.relabel.as_ref().is_none_or(|j| j.outcome.is_some()),
+            Screen::PartWork => self.state.part_work.as_ref().is_none_or(|j| j.outcome.is_some()),
+            Screen::SkywardUpdate => self.state.skyward_job.as_ref().is_none_or(|j| j.outcome.is_some()),
+            Screen::BackupJob => self.state.backup_job.as_ref().is_none_or(|j| j.outcome.is_some()),
+            Screen::Systems => self.state.systems_work.is_none(),
             Screen::Installing => matches!(self.state.install,
                 Install::Checking { stage: Some(Stage::Signature { .. }), .. }
                 | Install::Starting | Install::Locked(_) | Install::Waiting | Install::Choosing(_)
@@ -4894,6 +5064,16 @@ impl App {
             // A slot picked and not switched to is put down.
             Screen::Slot => self.state.next_slot = None,
             Screen::Avb => self.state.avb_result = None,
+            // So is a system; the page stays while the boot partitions are
+            // being written, which nothing may cut short.
+            Screen::Systems => {
+                if self.state.systems_work.is_some() {
+                    self.say(l.pick(["正在写入，请等待写入完成", "正在寫入，請等待寫入完成", "Writing. Wait for it to finish"]), now);
+                    return fx;
+                }
+                self.state.system_pick = None;
+                self.state.asking_delete = false;
+            }
             Screen::Files => {
                 if let Some(up) = self.state.files.up() {
                     return vec![Effect::ReadDir(up)];
@@ -5015,6 +5195,10 @@ impl App {
                     self.say(l.pick(["正在刷入，请等待刷入完成", "正在刷入，請等待刷入完成", "Flashing. Wait for it to finish"]), now);
                     return fx;
                 }
+                Install::Systeming { .. } => {
+                    self.say(l.pick(["正在安装，请等待安装完成", "正在安裝，請等待安裝完成", "Installing. Wait for it to finish"]), now);
+                    return fx;
+                }
                 Install::Opening => {
                     self.say(l.pick(DATA_OPENING), now);
                     return fx;
@@ -5027,6 +5211,7 @@ impl App {
                 | Install::Locked(_)
                 | Install::Waiting
                 | Install::Choosing(_)
+                | Install::SystemChoosing(_)
                 | Install::Confirming { .. }
                 | Install::ConfirmingScript => {
                     self.state.install = Install::Ending;
@@ -5077,7 +5262,7 @@ impl App {
         if matches!(ev, Event::Wipe | Event::Reboot(_)) {
             return;
         }
-        if matches!(ev, Event::Image { .. } | Event::Ready { .. } | Event::Script | Event::Done(_) | Event::Finished(_)) {
+        if matches!(ev, Event::Image { .. } | Event::Ready { .. } | Event::Script | Event::System { .. } | Event::Done(_) | Event::Finished(_)) {
             self.wake(now);
         }
         let install = &mut self.state.install;
@@ -5095,6 +5280,7 @@ impl App {
                 *install = Install::Choosing(Choice { kind, size, partitions, partition: 0, pick: Pick::Current })
             }
             Event::Script => *install = Install::ConfirmingScript,
+            Event::System { name, version, sizes } => *install = Install::SystemChoosing(SystemChoice { name, version, sizes, size: 0 }),
             Event::Running => {
                 *install = Install::Scripting { stage: None, running: true };
                 self.state.script_output.clear();
@@ -5110,7 +5296,8 @@ impl App {
                 Install::Checking { stage: shown, .. }
                 | Install::Updating { stage: shown, .. }
                 | Install::Flashing { stage: shown, .. }
-                | Install::Scripting { stage: shown, .. } => *shown = Some(stage),
+                | Install::Scripting { stage: shown, .. }
+                | Install::Systeming { stage: shown, .. } => *shown = Some(stage),
                 _ => {}
             },
             Event::Reflashed(reflash) => self.state.reflash = Some(reflash),
@@ -5146,6 +5333,7 @@ impl App {
             Screen::Filesystems => vec![Effect::ReadFilesystems],
             Screen::Slot | Screen::Reboot => vec![Effect::ReadSlots],
             Screen::Avb => vec![Effect::ReadAvb],
+            Screen::Systems => vec![Effect::ReadSystems],
             Screen::Restore => vec![self.find_backups()],
             Screen::Files => vec![Effect::ReadDir(self.state.files.path.clone())],
             Screen::Choose(place) if self.state.place_open(place) => vec![Effect::ReadPlace(place, self.state.folder(s).path.clone())],
@@ -5325,6 +5513,20 @@ impl App {
             Action::FlashSlots(pick) => {
                 if let Install::Choosing(choice) = &mut self.state.install {
                     choice.pick = pick;
+                    self.refresh();
+                }
+            }
+            Action::SystemSize(k) => {
+                if let Install::SystemChoosing(choice) = &mut self.state.install {
+                    choice.size = k;
+                    self.refresh();
+                }
+            }
+            Action::PickSystem(who) => {
+                if self.state.systems_work.is_none() {
+                    self.state.system_pick = Some(who);
+                    self.state.asking_delete = false;
+                    self.state.confirm = 0.0;
                     self.refresh();
                 }
             }
@@ -6041,9 +6243,14 @@ impl App {
     }
 
     pub fn touch(&mut self, ev: Touch, f: &Fonts, now: u64) -> Vec<Effect> {
-        // A finger on the dark panel lights nothing, as on the phone's own
-        // system, where the power key lights it.
+        // A finger on the dark panel lights nothing by itself, as on the
+        // phone's own system, where the power key lights it - except that a
+        // second tap where the first one landed lights it, which is that
+        // system's own double tap. Neither tap works anything on the page.
         if !self.display_on {
+            if let Touch::Down(x, y) = ev {
+                self.tap(now, x, y);
+            }
             return Vec::new();
         }
         // A finger on the charging screen sends it away for the page, and
@@ -6638,6 +6845,30 @@ impl App {
                     let partition = choice.partitions[choice.partition];
                     fx.push(Effect::Flash { partition, pick: choice.pick });
                     self.state.install = Install::Flashing { partition, stage: None };
+                    self.refresh();
+                }
+            }
+            Confirm::SwitchSystem => {
+                if let (Some(Ok(systems)), Some(pick)) = (&self.state.systems, self.state.system_pick) {
+                    if pick != starting(systems) {
+                        fx.push(Effect::SwitchSystem(pick));
+                        self.state.systems_work = Some(SystemsWork::Switching(pick));
+                        self.state.system_pick = None;
+                        self.refresh();
+                    }
+                }
+            }
+            Confirm::RemoveSystem => {
+                fx.push(Effect::RemoveSystem);
+                self.state.systems_work = Some(SystemsWork::Removing);
+                self.state.asking_delete = false;
+                self.state.system_pick = None;
+                self.refresh();
+            }
+            Confirm::InstallSystem => {
+                if let Install::SystemChoosing(choice) = &self.state.install {
+                    fx.push(Effect::InstallSystem { size: choice.sizes[choice.size] });
+                    self.state.install = Install::Systeming { name: choice.name.clone(), stage: None };
                     self.refresh();
                 }
             }
@@ -7443,6 +7674,15 @@ mod tests {
         assert!(app.touch(Touch::Up, &f, 5024).is_empty());
         assert_eq!(app.screen(), Screen::Installing);
         assert_eq!(app.state.install, Install::Wiping);
+        app.open(Screen::Systems);
+        app.state.systems_work = Some(SystemsWork::Removing);
+        app.frame(&f, &i);
+        app.touch(Touch::Down(10.0, 1600.0), &f, 6000);
+        app.touch(Touch::Move(410.0, 1600.0), &f, 6016);
+        assert!(app.preview.is_none(), "system writes keep the current page");
+        assert!(app.touch(Touch::Up, &f, 6024).is_empty());
+        assert_eq!(app.screen(), Screen::Systems);
+        assert_eq!(app.state.systems_work, Some(SystemsWork::Removing));
     }
 
     #[test]
@@ -9850,6 +10090,150 @@ mod tests {
         assert!(app.frame(&f, &i).hits.iter().all(|h| !matches!(h.action, Action::Confirm(_))), "nothing to swipe");
     }
 
+    /// The systems with a second one installed, the main one starting.
+    fn two_systems() -> Overview {
+        Overview {
+            installed: skyward_systems::Named { name: "HyperOS 3".into(), version: Some("OS3.0.308.0.WMACNXM".into()) },
+            other: Some(skyward_systems::Other { id: "ubuntu".into(), name: "Ubuntu Touch".into(), version: "24.04".into(), size: 16 << 30 }),
+            other_starts: false,
+            changed: false,
+        }
+    }
+
+    /// The systems page opened from the home page of a phone that can hold
+    /// a second system, with the systems read.
+    fn systems_page(f: &Fonts, i: &DeviceInfo, systems: Overview) -> App {
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.state.dual_boot = true;
+        assert_eq!(tap(&mut app, f, i, Action::Open(Screen::Systems)), vec![Effect::ReadSystems], "read as the page opens");
+        app.set_systems(Ok(systems));
+        app
+    }
+
+    fn swipes(app: &mut App, f: &Fonts, i: &DeviceInfo) -> bool {
+        app.frame(f, i).hits.iter().any(|h| matches!(h.action, Action::Confirm(_)))
+    }
+
+    #[test]
+    fn the_home_page_offers_the_systems_where_the_phone_can_hold_a_second() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        assert!(app.frame(&f, &i).hits.iter().all(|h| h.action != Action::Open(Screen::Systems)), "no init_boot partitions in both slots");
+        let app = systems_page(&f, &i, two_systems());
+        assert_eq!(app.screen(), Screen::Systems);
+        let named = |systems| {
+            let mut app = App::new(Screen::Home, W, H, PPD);
+            (app.state.dual_boot, app.state.systems) = (true, Some(Ok(systems)));
+            let t = app.theme();
+            let cx = Ctx { t: &t, f: &f, info: &i, state: &app.state, term: None, band: None };
+            pages::render(Screen::Home, &cx).canvas.data.clone()
+        };
+        assert!(named(two_systems()) != named(Overview { other_starts: true, ..two_systems() }), "the home page names the one that starts");
+    }
+
+    #[test]
+    fn the_systems_page_switches_to_the_system_picked() {
+        let (f, i) = (fonts(), info());
+        let mut app = systems_page(&f, &i, two_systems());
+        assert!(!swipes(&mut app, &f, &i), "the main system starts already");
+        tap(&mut app, &f, &i, Action::PickSystem(Who::Other));
+        assert_eq!(swipe(&mut app, &f, &i, Confirm::SwitchSystem), vec![Effect::SwitchSystem(Who::Other)]);
+        assert_eq!((app.state.systems_work, app.state.system_pick), (Some(SystemsWork::Switching(Who::Other)), None));
+        assert!(app.frame(&f, &i).hits.is_empty(), "nothing to tap while the boot partitions are written");
+        // The card tapped darkens and comes back, as a row of a list does.
+        app.tick(1000);
+        app.key(Key::Back, 1000);
+        assert_eq!((app.screen(), app.deadline(1000)), (Screen::Systems, Some(1000 + TOAST_MS)), "the page stays until they are, and says why");
+        app.systems_work_failed("the store's header does not check", 0);
+        assert_eq!(app.state.systems_work, None);
+        app.set_systems(Ok(Overview { other_starts: true, ..two_systems() }));
+        tap(&mut app, &f, &i, Action::PickSystem(Who::Installed));
+        assert_eq!(swipe(&mut app, &f, &i, Confirm::SwitchSystem), vec![Effect::SwitchSystem(Who::Installed)]);
+        app.set_systems(Ok(two_systems()));
+        tap(&mut app, &f, &i, Action::PickSystem(Who::Other));
+        app.key(Key::Back, 0);
+        assert_eq!((app.screen(), app.state.system_pick), (Screen::Home, None), "a pick left unswitched is put down");
+    }
+
+    #[test]
+    fn the_second_system_waits_for_an_update_in_flight_and_the_main_one_does_not() {
+        let (f, i) = (fonts(), DeviceInfo { snapshot: SnapshotState::Snapshotted, ..info() });
+        let mut app = systems_page(&f, &i, two_systems());
+        tap(&mut app, &f, &i, Action::PickSystem(Who::Other));
+        assert!(!swipes(&mut app, &f, &i), "nothing to swipe");
+        app.set_systems(Ok(Overview { other_starts: true, ..two_systems() }));
+        tap(&mut app, &f, &i, Action::PickSystem(Who::Installed));
+        assert_eq!(swipe(&mut app, &f, &i, Confirm::SwitchSystem), vec![Effect::SwitchSystem(Who::Installed)], "back to the main system to merge it");
+    }
+
+    #[test]
+    fn the_second_system_is_removed_once_asked_and_swiped() {
+        let (f, i) = (fonts(), info());
+        let mut app = systems_page(&f, &i, two_systems());
+        assert!(app.frame(&f, &i).hits.iter().any(|h| h.action == Action::Open(Screen::Decrypt)), "the data partition is opened first");
+        app.state.data = Data::Open;
+        app.refresh();
+        tap(&mut app, &f, &i, Action::AskDelete);
+        assert_eq!(swipe(&mut app, &f, &i, Confirm::RemoveSystem), vec![Effect::RemoveSystem]);
+        assert_eq!((app.state.systems_work, app.state.asking_delete), (Some(SystemsWork::Removing), false));
+        app.set_systems(Ok(Overview { other: None, ..two_systems() }));
+        assert_eq!(app.state.systems_work, None);
+        assert!(app.frame(&f, &i).hits.iter().all(|h| h.action != Action::AskDelete), "nothing left to remove");
+        tap(&mut app, &f, &i, Action::Open(Screen::Install));
+        assert_eq!(app.screen(), Screen::Install, "the empty place opens the install page");
+    }
+
+    #[test]
+    fn a_system_installs_beside_the_main_one_in_the_room_chosen() {
+        let (f, i) = (fonts(), info());
+        let mut app = sideloading(&f, &i);
+        app.install(Event::Checking { size: 3 << 30 }, 0);
+        app.install(Event::System { name: "Ubuntu Touch".into(), version: "24.04".into(), sizes: vec![3 << 30, 8 << 30, 16 << 30] }, 0);
+        // The package lit the panel, so the user looks and taps past the
+        // wake guard.
+        tap_at(&mut app, &f, &i, Action::SystemSize(1), 1000);
+        let track = app.frame(&f, &i).hits.iter().find(|h| h.action == Action::Confirm(Confirm::InstallSystem)).unwrap().rect;
+        let y = track.centre().1 - app.top().1;
+        app.touch(Touch::Down(track.x + track.h / 2.0, y), &f, 1000);
+        app.touch(Touch::Move(track.x + track.w, y), &f, 1000);
+        assert_eq!(app.touch(Touch::Up, &f, 1000), vec![Effect::Haptic, Effect::InstallSystem { size: 8 << 30 }]);
+        assert_eq!(app.state.install, Install::Systeming { name: "Ubuntu Touch".into(), stage: None });
+        app.install(Event::Progress(Stage::Root { done: 1 << 30, total: 6 << 30 }), 1000);
+        assert_eq!(app.state.install, Install::Systeming { name: "Ubuntu Touch".into(), stage: Some(Stage::Root { done: 1 << 30, total: 6 << 30 }) });
+        app.key(Key::Back, 1000);
+        assert_eq!(app.screen(), Screen::Installing, "the root being written keeps the page");
+        app.install(Event::Finished(Outcome::SystemInstalled { name: "Ubuntu Touch".into() }), 1000);
+        assert_eq!(tap_at(&mut app, &f, &i, Action::Open(Screen::Systems), 2000), vec![Effect::ReadSystems]);
+        assert_eq!(app.screen(), Screen::Systems);
+    }
+
+    #[test]
+    fn a_switch_asked_for_shows_before_the_systems_are_read() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.state.dual_boot = true;
+        app.switch_asked(Who::Installed);
+        assert_eq!((app.screen(), app.state.systems_work), (Screen::Systems, Some(SystemsWork::Switching(Who::Installed))));
+        assert!(app.frame(&f, &i).hits.is_empty());
+    }
+
+    #[test]
+    fn a_stopped_second_system_says_why_on_its_page_and_from_the_home_card() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.state.dual_boot = true;
+        app.system_stopped("no partition userdata showed within 15s".into());
+        assert_eq!(app.screen(), Screen::Systems);
+        app.set_systems(Ok(Overview { other_starts: true, ..two_systems() }));
+        let page = app.frame(&f, &i);
+        assert!(page.hits.iter().any(|h| h.action == Action::PickSystem(Who::Installed)), "the main system is there to switch back to");
+        assert!(!page.hits.iter().any(|h| h.action == Action::Confirm(Confirm::SwitchSystem)), "nothing is switched until one is picked");
+        app.key(Key::Back, 0);
+        assert_eq!(app.screen(), Screen::Home);
+        let opens = app.frame(&f, &i).hits.iter().filter(|h| h.action == Action::Open(Screen::Systems)).count();
+        assert_eq!(opens, 2, "the card says so above the entry to the systems");
+    }
+
     /// Whether the page shows a key of the keypad or keyboard to tap.
     fn keys_shown(app: &mut App, f: &Fonts, i: &DeviceInfo) -> bool {
         app.frame(f, i).hits.iter().any(|h| matches!(h.action, Action::Type(_)))
@@ -11516,16 +11900,73 @@ mod tests {
         let mut app = App::new(Screen::Home, W, H, PPD);
         let (x, y) = spot(&mut app, &f, &i, Action::Open(Screen::Settings));
         press(&mut app, Key::Power, 0);
+        // One tap alone is not the second of a double tap, so the panel stays
+        // dark and the page under it is not worked.
         assert!(app.touch(Touch::Down(x, y), &f, 100).is_empty());
         assert!(app.touch(Touch::Move(x, y - 300.0), &f, 120).is_empty());
         assert!(app.touch(Touch::Up, &f, 140).is_empty());
         assert!(!app.display_on(), "the panel stays dark");
         assert_eq!(app.screen(), Screen::Home, "the tap pressed nothing");
         assert_eq!(app.top().1, 0.0, "nor scrolled the page");
-        press(&mut app, Key::Power, 200);
+        // A tap far from the first is a tap of its own.
+        assert!(app.touch(Touch::Down(x + W as f32 * 0.5, y), &f, 200).is_empty());
+        assert!(app.touch(Touch::Up, &f, 220).is_empty());
+        assert!(!app.display_on(), "a tap elsewhere is not the second of a double tap");
+        press(&mut app, Key::Power, 400);
         assert!(app.display_on());
-        tap_at(&mut app, &f, &i, Action::Open(Screen::Settings), 700);
+        // Past the guard that keeps a stray touch just after the panel lit
+        // from acting, the same tap works the page.
+        tap_at(&mut app, &f, &i, Action::Open(Screen::Settings), 400 + WAKE_GUARD_MS + 10);
         assert_eq!(app.screen(), Screen::Settings, "a tap on the lit panel does");
+    }
+
+    /// Two taps on the dark panel light it, as the phone's own system's double
+    /// tap does, and neither tap works the page: they are one gesture that
+    /// lights the panel.
+    #[test]
+    fn two_taps_on_the_dark_panel_light_it() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        let (x, y) = spot(&mut app, &f, &i, Action::Open(Screen::Settings));
+        press(&mut app, Key::Power, 0);
+        for (at, lit) in [(100, false), (200, true)] {
+            app.touch(Touch::Down(x, y), &f, at);
+            app.touch(Touch::Up, &f, at + 20);
+            assert_eq!(app.display_on(), lit, "after the tap at {at} ms");
+        }
+        assert_eq!(app.screen(), Screen::Home, "the taps pressed nothing: they lit the panel");
+        assert_eq!(app.panel(320), Some(SLIDER_START), "and the panel comes up at full brightness");
+        // The next tap, past the guard that keeps a touch just after the panel
+        // lit from acting, works the page.
+        let after = 200 + WAKE_GUARD_MS + 10;
+        app.touch(Touch::Down(x, y), &f, after);
+        app.touch(Touch::Up, &f, after + 20);
+        assert_eq!(app.screen(), Screen::Settings);
+    }
+
+    /// The two taps of one double tap are close together on the glass and
+    /// inside Android's own window; anything else is a tap of its own, and the
+    /// panel stays dark.
+    #[test]
+    fn taps_too_far_apart_or_too_late_do_not_light_the_panel() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        let (x, y) = spot(&mut app, &f, &i, Action::Open(Screen::Settings));
+        press(&mut app, Key::Power, 0);
+        // Too late: the window the first tap opened has gone by.
+        app.touch(Touch::Down(x, y), &f, 100);
+        app.touch(Touch::Up, &f, 120);
+        app.touch(Touch::Down(x, y), &f, 100 + Tap::WINDOW_MS + 50);
+        app.touch(Touch::Up, &f, 100 + Tap::WINDOW_MS + 70);
+        assert!(!app.display_on(), "a tap past the window starts a count of its own");
+        // Too far: the tap after it lands elsewhere on the glass.
+        let far = W as f32 * (Tap::SLOP + 0.05);        app.touch(Touch::Down(x + far, y), &f, 100 + Tap::WINDOW_MS + 100);
+        app.touch(Touch::Up, &f, 100 + Tap::WINDOW_MS + 120);
+        assert!(!app.display_on(), "a tap far from the last is not its pair");
+        // The two that are both soon and close do light it.
+        app.touch(Touch::Down(x + far, y), &f, 100 + Tap::WINDOW_MS + 150);
+        app.touch(Touch::Up, &f, 100 + Tap::WINDOW_MS + 170);
+        assert!(app.display_on());
     }
 
     #[test]

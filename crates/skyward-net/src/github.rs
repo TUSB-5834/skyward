@@ -1,10 +1,13 @@
-//! Skyward's own releases on GitHub: which is the newest, and the zip in
-//! it for one phone, as the release workflow names each phone's.
+//! Skyward's own releases on GitHub: which is the newest, and the image in
+//! it for this phone, as the release workflow names it.
 
 use anyhow::{bail, ensure, Context, Result};
 use serde::Deserialize;
 
-/// Where GitHub answers which release of Skyward is the newest.
+/// The repository that publishes builds for this fork, including dada.
+pub const REPOSITORY: &str = "TUSB-5834/skyward";
+
+/// Where GitHub answers which release of this fork is the newest.
 pub const LATEST: &str = "https://api.github.com/repos/TUSB-5834/skyward/releases/latest";
 
 /// The version of GitHub's API the answer is read as.
@@ -17,15 +20,15 @@ pub struct Newest {
     pub version: String,
     /// It is newer than the build that asked.
     pub newer: bool,
-    /// Its zip for the phone; none when it has none.
+    /// Its build for the phone; none when it has none.
     pub build: Option<Build>,
 }
 
-/// A phone's zip in a release, which holds Skyward's image for the phone.
+/// A phone's build in a release, which is Skyward's image for the phone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Build {
-    /// The zip's own name, such as
-    /// skyward-v0.1.4-ishtar-OS3.0.308.0.WMACNXM.zip.
+    /// The image's own name, such as
+    /// skyward-v0.1.4-ishtar-OS3.0.308.0.WMACNXM.img.
     pub name: String,
     /// Where GitHub's API hands it out, which [`locate`] asks for where the
     /// file itself is.
@@ -38,7 +41,7 @@ pub struct Build {
 }
 
 impl Build {
-    /// Where to download the zip from, in the order to try: the file's own
+    /// Where to download the image from, in the order to try: the file's own
     /// short-lived address, where GitHub's API gave one, then the release's
     /// link on github.com, which some networks do not reach.
     pub fn sources(&self, located: Option<String>) -> Vec<String> {
@@ -70,7 +73,7 @@ struct Message {
 }
 
 /// The newest release that `answer`, GitHub's answer at [`LATEST`], tells
-/// of, and its zip for the phone `codename` names, as the build of version
+/// of, and its build for the phone `codename` names, as the build of version
 /// `running` sees it.
 pub fn newest(answer: &str, codename: &str, running: &str) -> Result<Newest> {
     let release: Release = serde_json::from_str(answer).context("read GitHub's answer")?;
@@ -78,10 +81,9 @@ pub fn newest(answer: &str, codename: &str, running: &str) -> Result<Newest> {
     let version = tag.strip_prefix('v').with_context(|| format!("the newest release is tagged {tag}, which is not v and a version"))?;
     let newest = semver::Version::parse(version).with_context(|| format!("the newest release is tagged {tag}"))?;
     let this = semver::Version::parse(running).with_context(|| format!("this build's version is {running}"))?;
-    // Each zip is named skyward-, the tag, the phone's codename, and the
-    // stock build the image is made on.
+    // Match the whole codename and take either a raw image or its release ZIP.
     let start = format!("skyward-{tag}-{codename}-");
-    let build = match release.assets.into_iter().find(|a| a.name.starts_with(&start) && a.name.ends_with(".zip")) {
+    let build = match release.assets.into_iter().find(|a| a.name.starts_with(&start) && (a.name.ends_with(".img") || a.name.ends_with(".zip"))) {
         None => None,
         Some(a) => {
             let sha256 = a.digest.as_deref().and_then(|d| d.strip_prefix("sha256:")).with_context(|| format!("GitHub gives no SHA-256 of {}", a.name))?;
@@ -92,7 +94,7 @@ pub fn newest(answer: &str, codename: &str, running: &str) -> Result<Newest> {
     Ok(Newest { version: version.to_string(), newer: newest > this, build })
 }
 
-/// Ask GitHub for Skyward's newest release, and its zip for the phone
+/// Ask GitHub for Skyward's newest release, and its build for the phone
 /// `codename` names, as the build of version `running`.
 pub fn ask(agent: &ureq::Agent, codename: &str, running: &str) -> Result<Newest> {
     let mut response = agent
@@ -149,19 +151,19 @@ mod tests {
 
     /// What GitHub answered of the newest release on 2026-11-07, with the
     /// parts that do not matter here left out.
-    const ANSWERED_013: &str = r#"{"url":"https://api.github.com/repos/kirklin/skyward/releases/437365758","tag_name":"v0.1.3","name":"v0.1.3","draft":false,"prerelease":false,"assets":[{"url":"https://api.github.com/repos/kirklin/skyward/releases/assets/719751468","id":719751468,"name":"SHA256SUMS","label":"","content_type":"application/octet-stream","state":"uploaded","size":2337,"digest":"sha256:052f9ca757baeb2eac78c8e546bcc54178f6bb9bf9e5bde53fa81b3f48448957","browser_download_url":"https://github.com/kirklin/skyward/releases/download/v0.1.3/SHA256SUMS"},{"url":"https://api.github.com/repos/kirklin/skyward/releases/assets/719751598","id":719751598,"name":"skyward-v0.1.3-ishtar-OS3.0.308.0.WMACNXM.zip","label":"Xiaomi 13 Ultra (ishtar)","content_type":"application/zip","state":"uploaded","size":42739608,"digest":"sha256:62b66f7d13a0eb6c9af3359b5ec6f9c223fd9a86b1f8abab3e9d2646cb2ce534","browser_download_url":"https://github.com/kirklin/skyward/releases/download/v0.1.3/skyward-v0.1.3-ishtar-OS3.0.308.0.WMACNXM.zip"},{"url":"https://api.github.com/repos/kirklin/skyward/releases/assets/719751747","id":719751747,"name":"skyward-v0.1.3-nezha-OS4.0.4.0.XPACNXM.zip","label":"Xiaomi 17 Ultra (nezha)","content_type":"application/zip","state":"uploaded","size":43145196,"digest":"sha256:9f6165079529418d8f6635beddfdd9abf9a70c89d69eb467a9922b0db69bfaf1","browser_download_url":"https://github.com/kirklin/skyward/releases/download/v0.1.3/skyward-v0.1.3-nezha-OS4.0.4.0.XPACNXM.zip"}]}"#;
+    const ANSWERED_013: &str = r#"{"url":"https://api.github.com/repos/TUSB-5834/skyward/releases/437365758","tag_name":"v0.1.3","name":"v0.1.3","draft":false,"prerelease":false,"assets":[{"url":"https://api.github.com/repos/TUSB-5834/skyward/releases/assets/719751468","id":719751468,"name":"SHA256SUMS","label":"","content_type":"application/octet-stream","state":"uploaded","size":2337,"digest":"sha256:052f9ca757baeb2eac78c8e546bcc54178f6bb9bf9e5bde53fa81b3f48448957","browser_download_url":"https://github.com/TUSB-5834/skyward/releases/download/v0.1.3/SHA256SUMS"},{"url":"https://api.github.com/repos/TUSB-5834/skyward/releases/assets/719751598","id":719751598,"name":"skyward-v0.1.3-ishtar-OS3.0.308.0.WMACNXM.img","label":"Xiaomi 13 Ultra (ishtar)","content_type":"application/octet-stream","state":"uploaded","size":42739608,"digest":"sha256:62b66f7d13a0eb6c9af3359b5ec6f9c223fd9a86b1f8abab3e9d2646cb2ce534","browser_download_url":"https://github.com/TUSB-5834/skyward/releases/download/v0.1.3/skyward-v0.1.3-ishtar-OS3.0.308.0.WMACNXM.img"},{"url":"https://api.github.com/repos/TUSB-5834/skyward/releases/assets/719751747","id":719751747,"name":"skyward-v0.1.3-nezha-OS4.0.4.0.XPACNXM.img","label":"Xiaomi 17 Ultra (nezha)","content_type":"application/octet-stream","state":"uploaded","size":43145196,"digest":"sha256:9f6165079529418d8f6635beddfdd9abf9a70c89d69eb467a9922b0db69bfaf1","browser_download_url":"https://github.com/TUSB-5834/skyward/releases/download/v0.1.3/skyward-v0.1.3-nezha-OS4.0.4.0.XPACNXM.img"}]}"#;
 
     #[test]
-    fn the_newest_release_gives_the_zip_for_the_phone() {
+    fn the_newest_release_gives_the_build_for_the_phone() {
         let n = newest(ANSWERED_013, "ishtar", "0.1.2").unwrap();
         assert_eq!(n.version, "0.1.3");
         assert!(n.newer);
         assert_eq!(
             n.build,
             Some(Build {
-                name: "skyward-v0.1.3-ishtar-OS3.0.308.0.WMACNXM.zip".into(),
-                url: "https://api.github.com/repos/kirklin/skyward/releases/assets/719751598".into(),
-                link: "https://github.com/kirklin/skyward/releases/download/v0.1.3/skyward-v0.1.3-ishtar-OS3.0.308.0.WMACNXM.zip".into(),
+                name: "skyward-v0.1.3-ishtar-OS3.0.308.0.WMACNXM.img".into(),
+                url: "https://api.github.com/repos/TUSB-5834/skyward/releases/assets/719751598".into(),
+                link: "https://github.com/TUSB-5834/skyward/releases/download/v0.1.3/skyward-v0.1.3-ishtar-OS3.0.308.0.WMACNXM.img".into(),
                 size: 42739608,
                 sha256: "62b66f7d13a0eb6c9af3359b5ec6f9c223fd9a86b1f8abab3e9d2646cb2ce534".into(),
             })
@@ -170,9 +172,9 @@ mod tests {
     }
 
     #[test]
-    fn a_zip_is_downloaded_from_where_github_sends_it_then_from_its_link() {
+    fn an_image_is_downloaded_from_where_github_sends_it_then_from_its_link() {
         let build = newest(ANSWERED_013, "ishtar", "0.1.2").unwrap().build.unwrap();
-        let link = "https://github.com/kirklin/skyward/releases/download/v0.1.3/skyward-v0.1.3-ishtar-OS3.0.308.0.WMACNXM.zip";
+        let link = "https://github.com/TUSB-5834/skyward/releases/download/v0.1.3/skyward-v0.1.3-ishtar-OS3.0.308.0.WMACNXM.img";
         assert_eq!(build.sources(Some("https://release-assets.githubusercontent.com/a?sig=1".into())), ["https://release-assets.githubusercontent.com/a?sig=1", link]);
         assert_eq!(build.sources(None), [link], "where GitHub's API gave no address");
     }
@@ -182,7 +184,7 @@ mod tests {
     fn server(answer: String) -> (String, std::thread::JoinHandle<String>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/repos/kirklin/skyward/releases/assets/719751598", listener.local_addr().unwrap());
+        let url = format!("http://{}/repos/TUSB-5834/skyward/releases/assets/719751598", listener.local_addr().unwrap());
         let held = std::thread::spawn(move || {
             let (mut s, _) = listener.accept().unwrap();
             let mut request = Vec::new();
@@ -198,7 +200,7 @@ mod tests {
     }
 
     #[test]
-    fn github_s_api_sends_a_zip_on_to_where_the_file_is() {
+    fn github_s_api_sends_the_image_on_to_where_the_file_is() {
         let agent = crate::http::agent(Default::default());
         let sent_on = "HTTP/1.1 302 Found\r\nLocation: https://release-assets.githubusercontent.com/a?sig=1\r\nContent-Length: 0\r\n\r\n";
         let (url, held) = server(sent_on.into());
@@ -222,18 +224,29 @@ mod tests {
     }
 
     #[test]
+    fn releases_accept_images_and_zips_for_the_same_device() {
+        for suffix in [".img", ".zip"] {
+            let answer = ANSWERED_013.replace(".img", suffix);
+            let build = newest(&answer, "ishtar", "0.1.2").unwrap().build.unwrap();
+            assert!(build.name.ends_with(suffix));
+            assert_eq!(build.sha256, "62b66f7d13a0eb6c9af3359b5ec6f9c223fd9a86b1f8abab3e9d2646cb2ce534");
+            assert!(newest(&answer, "ish", "0.1.2").unwrap().build.is_none());
+        }
+    }
+
+    #[test]
     fn a_phone_is_found_by_its_whole_codename() {
-        assert_eq!(newest(ANSWERED_013, "fuxi", "0.1.2").unwrap().build, None, "a phone the release has no zip for");
+        assert_eq!(newest(ANSWERED_013, "fuxi", "0.1.2").unwrap().build, None, "a phone the release has no build for");
         assert_eq!(newest(ANSWERED_013, "ish", "0.1.2").unwrap().build, None, "the start of another phone's codename");
         assert_eq!(newest(ANSWERED_013, "SHA256SUMS", "0.1.2").unwrap().build, None);
     }
 
     #[test]
-    fn a_zip_needs_its_sha256_and_a_release_its_version() {
+    fn a_build_needs_its_sha256_and_a_release_its_version() {
         let unsummed = ANSWERED_013.replace("\"digest\":\"sha256:62b66f7d13a0eb6c9af3359b5ec6f9c223fd9a86b1f8abab3e9d2646cb2ce534\"", "\"digest\":null");
         let e = newest(&unsummed, "ishtar", "0.1.2").unwrap_err();
-        assert_eq!(e.to_string(), "GitHub gives no SHA-256 of skyward-v0.1.3-ishtar-OS3.0.308.0.WMACNXM.zip");
-        assert!(newest(&unsummed, "nezha", "0.1.2").is_ok(), "another phone's zip has its own");
+        assert_eq!(e.to_string(), "GitHub gives no SHA-256 of skyward-v0.1.3-ishtar-OS3.0.308.0.WMACNXM.img");
+        assert!(newest(&unsummed, "nezha", "0.1.2").is_ok(), "another phone's build has its own");
         let untagged = ANSWERED_013.replace("\"tag_name\":\"v0.1.3\"", "\"tag_name\":\"nightly\"");
         assert!(newest(&untagged, "ishtar", "0.1.2").is_err());
         assert!(newest("{}", "ishtar", "0.1.2").is_err());

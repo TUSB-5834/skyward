@@ -3,6 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub mod modprobe;
+
 /// Where a module source's files are in the recovery: the vendor_boot
 /// ramdisk's modules under /lib/modules, the vendor_dlkm and vendor
 /// partitions where they are mounted, and the kernel's own modules in
@@ -147,13 +149,11 @@ fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
+/// Hand the open module `file`, whose path is `path`, to the kernel with the
+/// settings `params`.
 #[cfg(target_os = "android")]
-pub fn insmod(path: impl AsRef<Path>, params: &str) -> Result<()> {
-    use std::ffi::CString;
+fn finit_module(file: &fs::File, path: &Path, params: &str) -> std::io::Result<()> {
     use std::os::unix::io::AsRawFd;
-    let path = path.as_ref();
-    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    let cparams = CString::new(params)?;
     // The phone's modules in vendor_dlkm are built with a different compiler
     // stamp than the recovery kernel -- 6.6.57 where the kernel is 6.6.118 --
     // and this kernel has no CONFIG_MODULE_FORCE_LOAD, so the
@@ -162,8 +162,12 @@ pub fn insmod(path: impl AsRef<Path>, params: &str) -> Result<()> {
     //
     // init_module is the call that does load them: the toybox insmod on this
     // phone uses it, and loading the touchscreen's drivers through it
-    // succeeded where finit_module answered ENOEXEC. finit_module stays as the
-    // fallback for a module it might take and this one refuse.
+    // succeeded where finit_module answered ENOEXEC. It takes the module's
+    // bytes rather than the open file; finit_module stays as the fallback for
+    // a module it might take and this one refuse.
+    let bytes = fs::read(path).map_err(|e| std::io::Error::new(e.kind(), format!("read {}: {e}", path.display())))?;
+    let cparams = std::ffi::CString::new(params)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let rc = unsafe { libc::syscall(libc::SYS_init_module, bytes.as_ptr(), bytes.len(), cparams.as_ptr()) };
     if rc == 0 {
         return Ok(());
@@ -172,24 +176,34 @@ pub fn insmod(path: impl AsRef<Path>, params: &str) -> Result<()> {
     if first.raw_os_error() == Some(libc::EEXIST) {
         return Ok(());
     }
-    let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let rc = unsafe { libc::syscall(libc::SYS_finit_module, file.as_raw_fd(), cparams.as_ptr(), 0) };
+    let rc = unsafe { libc::syscall(libc::SYS_finit_module, file.as_raw_fd(), cparams.as_ptr(), 0 as libc::c_int) };
     if rc != 0 {
         let second = std::io::Error::last_os_error();
         if second.raw_os_error() == Some(libc::EEXIST) {
             return Ok(());
         }
-        return Err(anyhow::Error::new(second).context(format!(
-            "load {} (init_module said {first}, finit_module said otherwise)",
-            path.display()
-        )));
+        return Err(std::io::Error::new(
+            second.kind(),
+            format!("load {} (init_module said {first}, finit_module said otherwise)", path.display()),
+        ));
     }
     Ok(())
 }
 
 #[cfg(not(target_os = "android"))]
-pub fn insmod(_path: impl AsRef<Path>, _params: &str) -> Result<()> {
-    anyhow::bail!("insmod is only implemented on android")
+fn finit_module(_file: &fs::File, _path: &Path, _params: &str) -> std::io::Result<()> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "modules are loaded only on the phone"))
+}
+
+pub fn insmod(path: impl AsRef<Path>, params: &str) -> Result<()> {
+    let path = path.as_ref();
+    let f = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    match finit_module(&f, path, params) {
+        Ok(()) => Ok(()),
+        // Already loaded is success for our purposes.
+        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("finit_module {}", path.display())),
+    }
 }
 
 #[cfg(test)]

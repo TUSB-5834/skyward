@@ -1,7 +1,7 @@
-//! A newer build of Skyward, as its release zips it: the image in the zip,
-//! checked to be Skyward for this phone, and the recovery partitions it
-//! goes into, those of the slot that starts next and of any other slot
-//! that holds Skyward.
+//! A newer build of Skyward, as its release carries it: the image itself,
+//! or the one-entry zip an older release wrapped it in, checked to be
+//! Skyward for this phone, and the recovery partitions it goes into, those
+//! of the slot that starts next and of any other slot that holds Skyward.
 
 use crate::image;
 use anyhow::{ensure, Context, Result};
@@ -12,10 +12,24 @@ use std::path::{Path, PathBuf};
 
 const PARTITION: &str = "recovery";
 
-/// The image the zip at `path` holds, its only entry, read whole.
+/// What a boot image starts with, which is what tells one from a zip.
+const ANDROID_MAGIC: &[u8] = b"ANDROID!";
+
+/// The image the file at `path` holds, read whole. A release puts the image
+/// on GitHub as it is, and the releases before 0.2.1 wrapped it in a zip of
+/// its own; both are read here, so a phone on either kind of release can go
+/// to the other.
 pub fn unzip(path: &Path) -> Result<Vec<u8>> {
-    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut zip = zip::ZipArchive::new(file).with_context(|| format!("read {} as a zip", path.display()))?;
+    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut start = [0u8; 8];
+    let read = file.read(&mut start).with_context(|| format!("read {}", path.display()))?;
+    if read == ANDROID_MAGIC.len() && start == ANDROID_MAGIC {
+        let mut image = Vec::new();
+        image.extend_from_slice(&start);
+        file.read_to_end(&mut image).with_context(|| format!("read {}", path.display()))?;
+        return Ok(image);
+    }
+    let mut zip = zip::ZipArchive::new(file).with_context(|| format!("read {} as an image or a zip", path.display()))?;
     ensure!(zip.len() == 1, "{} holds {} entries, and a release's zip holds its image alone", path.display(), zip.len());
     let mut entry = zip.by_index(0).context("open the image in the zip")?;
     ensure!(entry.name().ends_with(".img"), "the zip holds {}, which is not an image", entry.name());
@@ -75,17 +89,22 @@ mod tests {
     }
 
     #[test]
-    fn the_image_in_a_releases_zip_is_taken_whole() {
+    fn the_image_a_release_carries_is_taken_whole_zipped_or_not() {
         let image = skyward_for("ishtar");
         let zip = zipped(&[("skyward-v0.1.4-ishtar-OS3.0.308.0.WMACNXM.img", &image)]);
-        assert_eq!(unzip(zip.path()).unwrap(), image);
+        assert_eq!(unzip(zip.path()).unwrap(), image, "the older kind of release, which zipped it");
         let two = zipped(&[("a.img", &image), ("b.img", &image)]);
         assert!(unzip(two.path()).is_err(), "a zip with more than the image");
         let other = zipped(&[("notes.txt", b"not an image")]);
         assert!(unzip(other.path()).is_err());
-        let unzipped = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(unzipped.path(), &image).unwrap();
-        assert!(unzip(unzipped.path()).is_err(), "an image that is not zipped");
+        // What this fork's releases carry: the image itself, unzipped.
+        let plain = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(plain.path(), &image).unwrap();
+        assert_eq!(unzip(plain.path()).unwrap(), image);
+        // Neither an image nor a zip is refused rather than read as nonsense.
+        let nothing = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(nothing.path(), b"not an image at all").unwrap();
+        assert!(unzip(nothing.path()).is_err());
     }
 
     #[test]

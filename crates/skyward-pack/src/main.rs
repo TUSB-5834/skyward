@@ -7,11 +7,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 mod avb;
-mod image;
-mod ramdisk;
 
-use image::BootImage;
-use ramdisk::Ramdisk;
+use skyward_bootimg::{BootImage, Ramdisk};
 
 /// Builds Skyward recovery images from a device's own stock images.
 #[derive(Parser)]
@@ -22,6 +19,9 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// The commands carry the paths and lists they were given; the largest is a
+// few hundred bytes, which is the one copy clap parses into either way.
+#[allow(clippy::large_enum_variant)]
 enum Cmd {
     /// Print an image's header and the files in its ramdisk.
     List { image: PathBuf },
@@ -57,6 +57,11 @@ enum Cmd {
         /// Skyward built for the device (aarch64-linux-android).
         #[arg(long)]
         binary: PathBuf,
+        /// The first program of a system installed beside the installed
+        /// one, skyward-system-init built for the device and linked
+        /// statically.
+        #[arg(long)]
+        system_init: PathBuf,
         /// The device configuration, devices/<codename>.toml.
         #[arg(long)]
         config: PathBuf,
@@ -127,7 +132,7 @@ fn main() -> Result<()> {
             img.kernel = BootImage::read(&kernel)?.kernel;
             write(&out, &img, &img.to_bytes()?)
         }
-        Cmd::Recovery { stock, update_skyward, binary, config, font, mono, mono_license, firmware, modules, omapi, out } => {
+        Cmd::Recovery { stock, update_skyward, binary, system_init, config, font, mono, mono_license, firmware, modules, omapi, out } => {
             let size = partition_size(&stock)?;
             let mut img = BootImage::read(&stock)?;
             let mut rd = Ramdisk::decode(&img.ramdisk)?;
@@ -161,6 +166,7 @@ fn main() -> Result<()> {
             for command in paths::COMMANDS {
                 rd.link(command, recovery)?;
             }
+            put(&mut rd, paths::SYSTEM_INIT, 0o755, read(&system_init)?, update_skyward)?;
             put(&mut rd, paths::CONFIG, 0o644, read(&config)?, update_skyward)?;
             put(&mut rd, paths::FONT, 0o644, read(&font)?, update_skyward)?;
             put(&mut rd, paths::MONO, 0o644, read(&mono)?, update_skyward)?;

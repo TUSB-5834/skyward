@@ -34,8 +34,16 @@ $env:AR_aarch64_linux_android = "$llvm\llvm-ar.exe"
 $buildTarget = if ($HostBuild) { 'x86_64-pc-windows-gnu' } else { 'aarch64-linux-android' }
 $cargoArgs = @($(if ($Test) { 'test' } else { 'build' }), '--locked', '--release', '--target', $buildTarget, '-p', $Package)
 if (!$Online) { $cargoArgs += '--offline' }
+$taskAndroidFlags = $env:CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS
+$taskStaticInit = !$HostBuild -and $Package -eq 'skyward-system-init'
+if ($taskStaticInit) {
+    $env:CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS = '-C target-feature=+crt-static'
+}
 Push-Location $workspace
 try {
     & "$rust\bin\cargo.exe" @cargoArgs
     if ($LASTEXITCODE -ne 0) { throw "cargo exited with $LASTEXITCODE" }
-} finally { Pop-Location }
+} finally {
+    Pop-Location
+    if ($taskStaticInit) { $env:CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS = $taskAndroidFlags }
+}

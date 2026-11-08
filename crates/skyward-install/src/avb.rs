@@ -30,7 +30,7 @@ impl Default for Checks {
 
 impl Checks {
     pub fn mask(self) -> u32 {
-        u32::from(self.verity) * VERITY_DISABLED | u32::from(self.verification) * VERIFICATION_DISABLED
+        (u32::from(self.verity) * VERITY_DISABLED) | (u32::from(self.verification) * VERIFICATION_DISABLED)
     }
 }
 
