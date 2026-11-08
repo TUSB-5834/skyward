@@ -12,6 +12,8 @@ os_version_prop = "ro.mi.os.version.incremental"
 width = 1200
 height = 2670
 density = 520
+# rounded_corner_radius in the installed DevicesAndroidOverlay.
+corner_radius = 134
 # The O3 panel's native 422 DSC stream requires subpixel packing before
 # compression. Without SPR, blue appears magenta and red appears green.
 spr = "dada-o3"
@@ -59,6 +61,17 @@ libraries = ["/system/lib64", "/vendor/lib64"]
 oneshot = true
 user = "root"
 groups = ["root", "system", "wakelock", "graphics"]
+
+# The installed sun vendor exposes boot control over AIDL. Recovery must
+# publish its declaration and start it before the slots page can ask it.
+# Match vendor.boot-qti's root credentials from the phone's own init rc.
+[[service]]
+path = "/vendor/bin/hw/android.hardware.boot-service.qti"
+libraries = ["/system/lib64", "/vendor/lib64", "/mnt/system/system/lib64", "/mnt/system/system/lib64/bootstrap"]
+ready_service = "android.hardware.boot.IBootControl/default"
+description = "/vendor/etc/vintf/manifest/boot-service.qti.xml"
+user = "root"
+groups = ["root"]
 
 # The installed sun vendor build uses the Qualcomm AIDL key and credential
 # services. Its Gatekeeper declaration is in manifest_sun.xml, outside
