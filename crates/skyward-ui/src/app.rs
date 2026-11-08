@@ -2529,6 +2529,22 @@ struct Turn {
     spring: Option<Spring>,
 }
 
+/// A page as it showed before a child opened over it. Only pages still
+/// on the navigation stack are kept; status bars and toasts stay live.
+struct SavedPage {
+    canvas: Canvas,
+    dark: bool,
+    lang: Lang,
+}
+
+/// A return preview follows the finger without leaving the current page.
+/// A spring is present only while a cancelled swipe settles back at zero.
+struct BackPreview {
+    behind: Canvas,
+    progress: f32,
+    spring: Option<Spring>,
+}
+
 /// Whether a control is a row: as wide as the cards it lies on.
 fn row_wide(t: &Theme, r: Rect) -> bool {
     let m = &t.m;
@@ -2675,6 +2691,8 @@ pub struct App {
     /// A page sliding in over the page left, or off over the page gone
     /// back to.
     turn: Option<Turn>,
+    snapshots: Vec<Option<SavedPage>>,
+    preview: Option<BackPreview>,
     /// While a page slides: the page shown drawn on its own, and how it
     /// showed, to slide it again as it was while it shows the same.
     layer: Option<(View, Canvas)>,
@@ -2749,6 +2767,8 @@ impl App {
             row_art: None,
             shown: None,
             turn: None,
+            snapshots: vec![None],
+            preview: None,
             layer: None,
             stale: Vec::new(),
             cols: 0,
@@ -2809,6 +2829,7 @@ impl App {
                 || self.bar.moving(now)
                 || self.morph.is_some()
                 || self.turn.is_some()
+                || self.preview.as_ref().is_some_and(|p| p.spring.is_some())
                 || self.row_press.is_some_and(|p| p.changing(now) || p.gone(now))
                 || self.glowing());
         // The content going dark or coming up, and the charging screen's
@@ -2927,6 +2948,12 @@ impl App {
             self.dirty = true;
         }
         if self.blink_at(now).is_some_and(|(on, _)| on != self.caret_shown) || self.morph.is_some() || self.turn.is_some() {
+            self.dirty = true;
+        }
+        if let Some(spring) = self.preview.as_ref().and_then(|p| p.spring) {
+            if spring.at(now).1 {
+                self.preview = None;
+            }
             self.dirty = true;
         }
         if let Some(p) = self.row_press {
@@ -3183,6 +3210,9 @@ impl App {
 
     /// A page sliding over another comes to rest at once.
     fn end_turn(&mut self) {
+        if self.preview.take().is_some() {
+            self.dirty = true;
+        }
         if let Some(turn) = self.turn.take() {
             self.backdrop = Some(turn.left);
             self.dirty = true;
@@ -4320,8 +4350,8 @@ impl App {
                 // page left.
                 // A page opened shows nothing of itself until its edge comes
                 // in from the right: the page left alone shows.
-                let back = self.turn.as_ref().expect("sliding").back;
-                if !back && at >= self.w as i32 {
+                let back = self.turn.as_ref().is_some_and(|t| t.back);
+                if self.preview.is_none() && !back && at >= self.w as i32 {
                     let left = &self.turn.as_ref().expect("sliding").left;
                     out.slide(left, left, at, shift, dim, self.corners);
                 } else {
@@ -4334,8 +4364,12 @@ impl App {
                             c
                         }
                     };
-                    let turn = self.turn.as_ref().expect("sliding");
-                    let (front, behind) = if back { (&turn.left, &page) } else { (&page, &turn.left) };
+                    let (front, behind) = if let Some(preview) = &self.preview {
+                        (&page, &preview.behind)
+                    } else {
+                        let turn = self.turn.as_ref().expect("sliding");
+                        if back { (&turn.left, &page) } else { (&page, &turn.left) }
+                    };
                     out.slide(front, behind, at, shift, dim, self.corners);
                     self.layer = Some((view, page));
                 }
@@ -4529,6 +4563,10 @@ impl App {
     /// behind, and how dark that is; nothing once the slide is over. See
     /// [`Turn`].
     fn slid(&mut self, now: u64) -> Option<(i32, i32, f32)> {
+        if let Some(preview) = &self.preview {
+            let along = preview.spring.map_or(preview.progress, |s| s.at(now).0 / 1000.0).clamp(0.0, 1.0);
+            return Some(self.slide_geometry(along));
+        }
         let turn = self.turn.as_mut()?;
         let spring = *turn.spring.get_or_insert_with(|| {
             if turn.back {
@@ -4545,8 +4583,12 @@ impl App {
         // Where the page in front stands, in screen widths from the left
         // edge.
         let along = if turn.back { 1.0 + x / 1000.0 } else { x / 1000.0 };
+        Some(self.slide_geometry(along))
+    }
+
+    fn slide_geometry(&self, along: f32) -> (i32, i32, f32) {
         let w = self.w as f32;
-        Some(((along * w).round() as i32, (BEHIND_SHIFT * w * (1.0 - along)).round() as i32, BEHIND_DIM * (1.0 - along)))
+        ((along * w).round() as i32, (BEHIND_SHIFT * w * (1.0 - along)).round() as i32, BEHIND_DIM * (1.0 - along))
     }
 
     /// Whether the cursor of the text field on `screen` shows at `now`: it
@@ -4626,6 +4668,8 @@ impl App {
     /// Put the page back where it rests, for a page just opened or returned
     /// to; its first frame shows the bar as its scroll has it.
     fn settle_page(&mut self) {
+        self.snapshots.resize_with(self.stack.len(), || None);
+        self.preview = None;
         self.height = 0.0;
         self.fling = None;
         self.glide = None;
@@ -4687,6 +4731,14 @@ impl App {
     }
 
     fn push(&mut self, screen: Screen) {
+        // Search uses a morph instead of leave(); keep its parent too.
+        if self.turn.is_none() {
+            if let Some(view) = self.shown.filter(|_| self.frame.is_some()) {
+                let mut canvas = Canvas::new(self.w, self.h);
+                self.paint_page(&mut canvas, &self.theme(), None, &View { pressing: None, row: 0.0, ..view });
+                self.save_page(&canvas);
+            }
+        }
         self.stack.push((screen, 0.0, Focus::Unset));
         self.settle_page();
         self.refresh();
@@ -4705,7 +4757,7 @@ impl App {
         let Some(view) = self.shown.take() else { return };
         let mut left = self.backdrop.take().unwrap_or_else(|| Canvas::new(self.w, self.h));
         // The `<` comes up with the finger, before its page goes.
-        let view = View { pressing: None, ..view };
+        let view = View { pressing: None, row: 0.0, ..view };
         let t = self.theme();
         self.paint_page(&mut left, &t, None, &view);
         // A page left within the first frames of sliding in, before it was
@@ -4713,8 +4765,84 @@ impl App {
         if let Some(fr) = self.frame.as_ref().filter(|_| self.cols < self.w) {
             left.fill_rect(self.cols as f32, 0.0, (self.w - self.cols) as f32, self.h as f32, fr.bg);
         }
+        if !back {
+            self.save_page(&left);
+        }
         self.turn = Some(Turn { back, left, spring: None });
         self.dirty = true;
+    }
+
+    fn save_page(&mut self, canvas: &Canvas) {
+        self.snapshots.resize_with(self.stack.len(), || None);
+        *self.snapshots.last_mut().expect("the stack has a page") =
+            Some(SavedPage { canvas: canvas.clone(), dark: self.state.dark, lang: self.state.lang });
+    }
+
+    /// Only preview a return that will actually pop a page. Local back
+    /// actions and work that cannot be interrupted keep their own handling.
+    fn can_preview_back(&self, now: u64) -> bool {
+        if self.stack.len() <= 1 || self.morph.is_some() {
+            return false;
+        }
+        match self.screen() {
+            Screen::Search if self.stack[self.stack.len() - 2].0 == Screen::Home => false,
+            Screen::Files => self.state.files.up().is_none(),
+            Screen::Choose(place) => self.state.folder(Screen::Choose(place)).up().is_none(),
+            Screen::Editor => self.state.editor.as_ref().is_some_and(|e| {
+                !e.changed || self.unsaved_warned.is_some_and(|at| now < at + TOAST_MS)
+            }),
+            Screen::WlanAdd => !self.state.adding.as_ref().is_some_and(|a| a.choosing),
+            Screen::FileJob => !self.state.job.as_ref().is_some_and(|j| j.outcome.is_none()),
+            Screen::Relabel => !self.state.relabel.as_ref().is_some_and(|j| j.outcome.is_none()),
+            Screen::PartWork => !self.state.part_work.as_ref().is_some_and(|j| j.outcome.is_none()),
+            Screen::SkywardUpdate => !self.state.skyward_job.as_ref().is_some_and(|j| j.outcome.is_none()),
+            Screen::BackupJob => !self.state.backup_job.as_ref().is_some_and(|j| j.outcome.is_none()),
+            Screen::Installing => matches!(self.state.install,
+                Install::Checking { stage: Some(Stage::Signature { .. }), .. }
+                | Install::Starting | Install::Locked(_) | Install::Waiting | Install::Choosing(_)
+                | Install::Confirming { .. } | Install::ConfirmingScript | Install::Finished { .. }
+                | Install::Wiped(_) | Install::Idle | Install::Ending),
+            _ => true,
+        }
+    }
+
+    fn start_preview(&mut self, now: u64) {
+        if !self.can_preview_back(now) {
+            return;
+        }
+        let Some(saved) = self.snapshots.get(self.stack.len() - 2).and_then(|p| p.as_ref()) else { return };
+        if saved.dark == self.state.dark && saved.lang == self.state.lang {
+            self.preview = Some(BackPreview { behind: saved.canvas.clone(), progress: 0.0, spring: None });
+        }
+    }
+
+    fn move_edge(&mut self, start: f32, from_left: bool, x: f32, cy: f32, was_armed: bool) -> (Drag, bool) {
+        let travel = if from_left { x - start } else { start - x };
+        let armed = travel > self.theme().m.dp(BACK_SWIPE_DP);
+        if let Some(preview) = &mut self.preview {
+            preview.progress = (travel / self.w as f32).clamp(0.0, 1.0);
+        }
+        self.dirty = true;
+        (Drag::Edge { start, from_left, armed, x, cy }, armed && !was_armed && self.state.vibrate)
+    }
+
+    fn finish_edge(&mut self, armed: bool, now: u64) -> Vec<Effect> {
+        let preview = self.preview.take();
+        let depth = self.stack.len();
+        let fx = if armed { self.back(now) } else { Vec::new() };
+        if let Some(mut preview) = preview {
+            if self.stack.len() < depth {
+                if let Some(turn) = &mut self.turn {
+                    // Continue from the exact last preview position.
+                    turn.spring = Some(Spring::new(now, (preview.progress - 1.0) * 1000.0, 0.0, BACK_PERIOD));
+                }
+            } else {
+                preview.spring = Some(Spring::new(now, preview.progress * 1000.0, 0.0, BACK_PERIOD));
+                self.preview = Some(preview);
+            }
+            self.dirty = true;
+        }
+        fx
     }
 
     /// Set the home page's search bar moving up to the search page's field,
@@ -6048,9 +6176,11 @@ impl App {
                     self.tracker.add(now, y);
                     let (dx, dy) = (x - x0, y - y0);
                     self.drag = match at_edge {
-                        Some(from_left) if dx.abs() > slop && dx.abs() > dy.abs() => {
-                            self.dirty = true;
-                            Drag::Edge { start: x0, from_left, armed: false, x, cy: y0 - m.dp(CUE_LIFT_DP) }
+                        Some(from_left) if (if from_left { dx } else { -dx }) > slop && dx.abs() > dy.abs() => {
+                            self.start_preview(now);
+                            let (edge, click) = self.move_edge(x0, from_left, x, y0 - m.dp(CUE_LIFT_DP), false);
+                            fx.extend(click.then_some(Effect::Haptic));
+                            edge
                         }
                         _ if dy.abs() > slop => {
                             let history = self.frame.as_ref().and_then(|fr| fr.scrollback).filter(|(r, _)| r.contains(x0, y0 + scroll));
@@ -6066,6 +6196,7 @@ impl App {
                                 Drag::Scroll { last: y }
                             }
                         }
+                        _ if dx.abs() > slop => Drag::Held,
                         _ => Drag::Press { x: x0, y: y0, action, edge: at_edge, at },
                     };
                     if !matches!(self.drag, Drag::Press { .. }) {
@@ -6078,15 +6209,9 @@ impl App {
                     self.drag = Drag::Scroll { last: y };
                 }
                 Drag::Edge { start, from_left, armed, cy, .. } => {
-                    let travel = if from_left { x - start } else { start - x };
-                    let ready = travel > m.dp(BACK_SWIPE_DP);
-                    // A tap of the motor as the `<` appears, as the system
-                    // gives.
-                    if ready && !armed && self.state.vibrate {
-                        fx.push(Effect::Haptic);
-                    }
-                    self.drag = Drag::Edge { start, from_left, armed: ready, x, cy };
-                    self.dirty = true;
+                    let (edge, click) = self.move_edge(start, from_left, x, cy, armed);
+                    self.drag = edge;
+                    fx.extend(click.then_some(Effect::Haptic));
                 }
                 Drag::Slider(which, track) => {
                     self.set_slider(&t, which, track, x);
@@ -6116,6 +6241,11 @@ impl App {
                         p.lift(now);
                     }
                     fx.extend(self.act(a, now));
+                    // Only an accepted tap clicks; drags, wake touches and
+                    // slider/pattern controls have their own feedback.
+                    if self.state.vibrate && !matches!(a, Action::Slider(_) | Action::Pattern | Action::Confirm(_)) {
+                        fx.insert(0, Effect::Haptic);
+                    }
                 }
                 Drag::Press { x, y, action: None, .. } if self.screen() == Screen::Editor => self.place_caret(f, x, y + scroll),
                 Drag::History { pitch, .. } => {
@@ -6150,8 +6280,9 @@ impl App {
                         _ => self.settle_fold(now),
                     }
                 }
-                Drag::Edge { armed: true, .. } => fx.extend(self.back(now)),
+                Drag::Edge { armed: true, .. } => fx.extend(self.finish_edge(true, now)),
                 Drag::Edge { start, from_left, x, cy, .. } => {
+                    fx.extend(self.finish_edge(false, now));
                     // Short of going back, the cue sinks back into the edge.
                     let travel = if from_left { x - start } else { start - x };
                     let depth = widgets::back_cue_depth(&t, travel);
@@ -6164,6 +6295,9 @@ impl App {
                     self.repaint_confirm(&t, f, which, track);
                     if done {
                         fx.extend(self.confirmed(which, now));
+                        if self.state.vibrate {
+                            fx.insert(0, Effect::Haptic);
+                        }
                     }
                 }
                 Drag::Pattern => fx.extend(self.drawn(now)),
@@ -7158,6 +7292,12 @@ mod tests {
     }
 
     fn tap_at(app: &mut App, f: &Fonts, i: &DeviceInfo, action: Action, now: u64) -> Vec<Effect> {
+        // Navigation/business tests compare work effects; touch feedback is
+        // checked independently with the unfiltered events below.
+        tap_effects(app, f, i, action, now).into_iter().filter(|e| !matches!(e, Effect::Haptic)).collect()
+    }
+
+    fn tap_effects(app: &mut App, f: &Fonts, i: &DeviceInfo, action: Action, now: u64) -> Vec<Effect> {
         let (x, y) = spot(app, f, i, action);
         let mut fx = app.touch(Touch::Down(x, y), f, now);
         fx.extend(app.touch(Touch::Up, f, now));
@@ -7178,7 +7318,143 @@ mod tests {
         let (x, y) = widgets::button_rect(&app.theme()).centre();
         let mut fx = app.touch(Touch::Down(x, y), f, now);
         fx.extend(app.touch(Touch::Up, f, now));
-        fx
+        fx.into_iter().filter(|e| !matches!(e, Effect::Haptic)).collect()
+    }
+
+    #[test]
+    fn accepted_touch_buttons_click_once_before_their_work() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        assert_eq!(tap_effects(&mut app, &f, &i, Action::Open(Screen::Install), 1000), vec![Effect::Haptic]);
+        assert_eq!(tap_effects(&mut app, &f, &i, Action::Sideload, 2000), vec![Effect::Haptic, Effect::Sideload]);
+        app.state.vibrate = false;
+        app.frame(&f, &i);
+        let (x, y) = widgets::back_rect(&app.theme()).centre();
+        app.touch(Touch::Down(x, y), &f, 3000);
+        assert_eq!(app.touch(Touch::Up, &f, 3000), vec![Effect::Cancel], "turning vibration off leaves only the installer's cancellation");
+    }
+
+    #[test]
+    fn touch_vibration_switch_and_keyboard_use_the_same_click_path() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Settings, W, H, PPD);
+        assert!(tap_effects(&mut app, &f, &i, Action::Toggle(Switch::Vibrate), 1000).is_empty());
+        assert!(!app.state.vibrate);
+        assert_eq!(tap_effects(&mut app, &f, &i, Action::Toggle(Switch::Vibrate), 2000), vec![Effect::Haptic]);
+        let mut app = App::new(Screen::Search, W, H, PPD);
+        assert_eq!(tap_effects(&mut app, &f, &i, Action::Type(Cap::Char('a')), 1000), vec![Effect::Haptic]);
+        assert_eq!(app.state.search, "a");
+    }
+
+    #[test]
+    fn a_touch_dragged_off_a_button_does_not_click_or_open_it() {
+        let (f, i) = (fonts(), info());
+        for (dx, dy) in [(120.0, 0.0), (0.0, 120.0)] {
+            let mut app = App::new(Screen::Home, W, H, PPD);
+            let (x, y) = spot(&mut app, &f, &i, Action::Open(Screen::Settings));
+            assert!(app.touch(Touch::Down(x, y), &f, 1000).is_empty());
+            assert!(app.touch(Touch::Move(x + dx, y + dy), &f, 1100).is_empty());
+            assert!(app.touch(Touch::Up, &f, 1200).is_empty());
+            assert_eq!(app.screen(), Screen::Home);
+        }
+    }
+
+    fn preview_app(f: &Fonts, i: &DeviceInfo) -> (App, Canvas) {
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.set_screen_corners(140.0);
+        let mut c = Canvas::new(W, H);
+        app.compose(&mut c, f, i, "12:00", 0);
+        tap_at(&mut app, f, i, Action::Open(Screen::Mount), 1000);
+        app.compose(&mut c, f, i, "12:00", 1000);
+        app.compose(&mut c, f, i, "12:00", 3000);
+        (app, c)
+    }
+
+    #[test]
+    fn predictive_back_follows_both_edges_and_commits_without_restarting_the_slide() {
+        let (f, i) = (fonts(), info());
+        for from_left in [true, false] {
+            let (mut app, mut c) = preview_app(&f, &i);
+            let (start, x) = if from_left { (10.0, 410.0) } else { (W as f32 - 10.0, W as f32 - 410.0) };
+            app.touch(Touch::Down(start, 1600.0), &f, 4000);
+            assert_eq!(app.touch(Touch::Move(x, 1600.0), &f, 4016), vec![Effect::Haptic], "one move can arm the return");
+            assert_eq!(app.stack.len(), 2, "previewing has not popped the page");
+            assert_eq!(app.screen(), Screen::Mount);
+            assert_eq!(app.slid(4016).unwrap().0, 400);
+            app.compose(&mut c, &f, &i, "12:00", 4016);
+            let before_release = c.data.clone();
+            assert!(app.touch(Touch::Up, &f, 4024).is_empty(), "no second vibration on release");
+            assert_eq!(app.screen(), Screen::Home);
+            assert!(app.preview.is_none());
+            assert_eq!(app.slid(4024).unwrap().0, 400, "the completing spring starts where the finger left it");
+            app.compose(&mut c, &f, &i, "12:00", 4024);
+            // The edge cue disappears on release; the pages themselves
+            // remain continuous, including their rounded corners.
+            for y in [H / 3, H - 200, H - 3] {
+                let row = (y * W * 4) as usize..((y + 1) * W * 4) as usize;
+                assert_eq!(c.data[row.clone()], before_release[row], "both sides meet on row {y}");
+            }
+            app.compose(&mut c, &f, &i, "12:00", 6000);
+            assert!(app.turn.is_none());
+            assert_eq!(app.snapshots.len(), 1, "the child's cached page is released");
+        }
+    }
+
+    #[test]
+    fn predictive_back_cancels_to_the_same_page_and_preserves_rounded_corners() {
+        let (f, i) = (fonts(), info());
+        let (mut app, mut c) = preview_app(&f, &i);
+        let mount = c.clone();
+        let home = app.snapshots[0].as_ref().unwrap().canvas.clone();
+        app.touch(Touch::Down(10.0, 1600.0), &f, 4000);
+        app.touch(Touch::Move(110.0, 1600.0), &f, 4016);
+        app.compose(&mut c, &f, &i, "12:00", 4016);
+        let (front, behind, dim) = app.slid(4016).unwrap();
+        let keep = ((1.0 - dim) * 256.0).round() as u32;
+        let at = |c: &Canvas, x: u32, y: u32| c.data[((y * W + x) * 4) as usize] as u32;
+        let x = front as u32 + 5;
+        assert_eq!(at(&c, x, H - 3), (at(&home, x + behind as u32, H - 3) * keep) >> 8, "a rounded tip exposes the parent");
+        app.touch(Touch::Up, &f, 4024);
+        assert_eq!(app.slid(4024).unwrap().0, 100, "cancellation starts without a jump");
+        assert_eq!(app.screen(), Screen::Mount);
+        assert_eq!(app.stack.len(), 2);
+        assert_eq!(app.deadline(4024), Some(0));
+        app.tick(6000);
+        app.compose(&mut c, &f, &i, "12:00", 6000);
+        assert!(app.preview.is_none());
+        assert_eq!(c.data, mount.data, "the original page comes back whole");
+    }
+
+    #[test]
+    fn predictive_back_keeps_protected_work_and_outward_drags_on_the_current_page() {
+        let (f, i) = (fonts(), info());
+        let (mut app, _) = preview_app(&f, &i);
+        app.touch(Touch::Down(10.0, 1600.0), &f, 4000);
+        app.touch(Touch::Move(-100.0, 1600.0), &f, 4016);
+        assert!(app.preview.is_none());
+        assert!(app.touch(Touch::Up, &f, 4024).is_empty());
+        assert_eq!(app.screen(), Screen::Mount);
+        app.open(Screen::Installing);
+        app.state.install = Install::Wiping;
+        app.frame(&f, &i);
+        app.touch(Touch::Down(10.0, 1600.0), &f, 5000);
+        app.touch(Touch::Move(410.0, 1600.0), &f, 5016);
+        assert!(app.preview.is_none(), "no false preview while writing");
+        assert!(app.touch(Touch::Up, &f, 5024).is_empty());
+        assert_eq!(app.screen(), Screen::Installing);
+        assert_eq!(app.state.install, Install::Wiping);
+    }
+
+    #[test]
+    fn a_changed_theme_never_previews_an_old_theme_snapshot() {
+        let (f, i) = (fonts(), info());
+        let (mut app, _) = preview_app(&f, &i);
+        app.state.dark = true;
+        app.touch(Touch::Down(10.0, 1600.0), &f, 4000);
+        app.touch(Touch::Move(410.0, 1600.0), &f, 4016);
+        assert!(app.preview.is_none());
+        app.touch(Touch::Up, &f, 4024);
+        assert_eq!(app.screen(), Screen::Home, "the regular return still works");
     }
 
 
@@ -8377,7 +8653,7 @@ mod tests {
         app.touch(Touch::Move(track.x + track.w / 2.0, y), &f, 0);
         app.touch(Touch::Move(track.x + track.w, y), &f, 0);
         let fx = app.touch(Touch::Up, &f, 0);
-        assert_eq!(fx, vec![Effect::Reboot(Target::Bootloader)]);
+        assert_eq!(fx, vec![Effect::Haptic, Effect::Reboot(Target::Bootloader)]);
         assert_eq!(app.state.confirm, 0.0, "the knob springs back");
     }
 
@@ -8525,7 +8801,7 @@ mod tests {
         let y = track.centre().1 - app.top().1;
         app.touch(Touch::Down(track.x + track.h / 2.0, y), &f, 1000);
         app.touch(Touch::Move(track.x + track.w, y), &f, 1000);
-        assert_eq!(app.touch(Touch::Up, &f, 1000), vec![Effect::Flash { partition: "boot", pick: Pick::Both }]);
+        assert_eq!(app.touch(Touch::Up, &f, 1000), vec![Effect::Haptic, Effect::Flash { partition: "boot", pick: Pick::Both }]);
         assert_eq!(app.state.install, Install::Flashing { partition: "boot", stage: None });
         app.install(Event::Progress(Stage::Flashing { done: 10, total: 40 }), 1000);
         assert_eq!(app.state.install, Install::Flashing { partition: "boot", stage: Some(Stage::Flashing { done: 10, total: 40 }) });
@@ -9128,7 +9404,7 @@ mod tests {
         let y = track.centre().1 - app.top().1;
         app.touch(Touch::Down(track.x + track.h / 2.0, y), &f, 1000);
         app.touch(Touch::Move(track.x + track.w, y), &f, 1000);
-        assert_eq!(app.touch(Touch::Up, &f, 1000), vec![Effect::Install]);
+        assert_eq!(app.touch(Touch::Up, &f, 1000), vec![Effect::Haptic, Effect::Install]);
         assert_eq!(app.state.install, Install::Updating { version: Some("OS3.0.306.0.WMACNXM".into()), stage: None, overwriting: false });
         app.key(Key::Back, 1000);
         assert_eq!(app.screen(), Screen::Installing, "an update being written keeps the page");
@@ -9156,7 +9432,7 @@ mod tests {
         let y = track.centre().1 - app.top().1;
         app.touch(Touch::Down(track.x + track.h / 2.0, y), &f, 1000);
         app.touch(Touch::Move(track.x + track.w, y), &f, 1000);
-        assert_eq!(app.touch(Touch::Up, &f, 1000), vec![Effect::Install]);
+        assert_eq!(app.touch(Touch::Up, &f, 1000), vec![Effect::Haptic, Effect::Install]);
         assert_eq!(app.state.install, Install::Scripting { stage: None, running: false });
         app.install(Event::Running, 1000);
         for line in ["- Flashing boot", " ", "- Done"] {
@@ -9304,7 +9580,7 @@ mod tests {
         fx.extend(app.touch(Touch::Move(track.x + track.w / 2.0, y), f, 0));
         fx.extend(app.touch(Touch::Move(track.x + track.w, y), f, 0));
         fx.extend(app.touch(Touch::Up, f, 0));
-        fx
+        fx.into_iter().filter(|e| !matches!(e, Effect::Haptic)).collect()
     }
 
     #[test]
@@ -9797,7 +10073,7 @@ mod tests {
         let rest = pixel(&mut app, 0);
         app.touch(Touch::Down(x, y), &f, 100);
         assert_ne!(pixel(&mut app, 100), rest, "held down, its disc darkens");
-        assert_eq!(app.touch(Touch::Up, &f, 150), vec![Effect::StartShell("/data/adb".into())]);
+        assert_eq!(app.touch(Touch::Up, &f, 150), vec![Effect::Haptic, Effect::StartShell("/data/adb".into())]);
         for now in (150..1000).step_by(8) {
             pixel(&mut app, now);
         }
@@ -9810,7 +10086,7 @@ mod tests {
         }
         app.touch(Touch::Down(x, y), &f, 1500);
         pixel(&mut app, 1500);
-        assert_eq!(app.touch(Touch::Up, &f, 1550), vec![Effect::SaveText { path: "/data/adb/a.txt".into(), text: "ba".into() }]);
+        assert_eq!(app.touch(Touch::Up, &f, 1550), vec![Effect::Haptic, Effect::SaveText { path: "/data/adb/a.txt".into(), text: "ba".into() }]);
     }
 
     #[test]
