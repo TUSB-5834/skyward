@@ -7,6 +7,7 @@
 // The calls and answers serve the phone's own driver and the host tests.
 #![cfg_attr(not(target_os = "android"), allow(dead_code))]
 
+use crate::credential::Rejection;
 use anyhow::{bail, Context, Result};
 use skyward_binder::parcel::{Parcel, Reader};
 use skyward_binder::status;
@@ -69,8 +70,8 @@ fn ask_value(slot: u32, key: &[u8]) -> Parcel {
 fn value(read: &mut Reader) -> Result<Vec<u8>> {
     if let Err(e) = status::ok(read) {
         return Err(match status::refused_with(&e) {
-            Some(STATUS_INCORRECT_KEY) => e.context("the secure element does not recognise that credential"),
-            Some(STATUS_THROTTLE) => e.context("the secure element is holding off further tries"),
+            Some(STATUS_INCORRECT_KEY) => e.context(Rejection::Incorrect).context("the secure element does not recognise that credential"),
+            Some(STATUS_THROTTLE) => e.context(Rejection::Retry { seconds: None, incorrect: false }).context("the secure element is holding off further tries"),
             _ => e.context("read the slot of the weaver"),
         });
     }
@@ -87,11 +88,13 @@ fn value(read: &mut Reader) -> Result<Vec<u8>> {
     let seconds = (wait.max(0) as u64).div_ceil(1000);
     match said {
         READ_OK => Ok(value),
-        READ_THROTTLE => bail!("the secure element is holding off further tries for another {seconds} seconds"),
+        READ_THROTTLE => Err(anyhow::Error::new(Rejection::Retry { seconds: Some(seconds), incorrect: false })
+            .context(format!("the secure element is holding off further tries for another {seconds} seconds"))),
         READ_INCORRECT_KEY if wait > 0 => {
-            bail!("the secure element does not recognise that credential, and holds off further tries for another {seconds} seconds")
+            Err(anyhow::Error::new(Rejection::Retry { seconds: Some(seconds), incorrect: true })
+                .context(format!("the secure element does not recognise that credential, and holds off further tries for another {seconds} seconds")))
         }
-        READ_INCORRECT_KEY => bail!("the secure element does not recognise that credential"),
+        READ_INCORRECT_KEY => Err(anyhow::Error::new(Rejection::Incorrect).context("the secure element does not recognise that credential")),
         _ => bail!("the weaver failed to read the slot"),
     }
 }
@@ -198,13 +201,17 @@ mod tests {
             p.blob(&[]);
             p.i32(READ_INCORRECT_KEY);
         });
-        assert_eq!(value(&mut Reader::new(&wrong)).unwrap_err().to_string(), "the secure element does not recognise that credential");
+        let error = value(&mut Reader::new(&wrong)).unwrap_err();
+        assert_eq!(crate::credential::rejection(&error), Some(Rejection::Incorrect));
+        assert_eq!(error.to_string(), "the secure element does not recognise that credential");
         let wrong_and_wait = answered(|p| {
             p.i64(29_001);
             p.blob(&[]);
             p.i32(READ_INCORRECT_KEY);
         });
-        assert!(value(&mut Reader::new(&wrong_and_wait)).unwrap_err().to_string().ends_with("for another 30 seconds"));
+        let error = value(&mut Reader::new(&wrong_and_wait)).unwrap_err();
+        assert_eq!(crate::credential::rejection(&error), Some(Rejection::Retry { seconds: Some(30), incorrect: true }));
+        assert!(error.to_string().ends_with("for another 30 seconds"));
         let waiting = answered(|p| {
             p.i64(5_000);
             p.blob(&[]);
@@ -219,7 +226,8 @@ mod tests {
             p.blob(&[]);
             p.i32(1);
         });
-        assert!(value(&mut Reader::new(&failed)).is_err());
+        let error = value(&mut Reader::new(&failed)).unwrap_err();
+        assert_eq!(crate::credential::rejection(&error), None, "a failed read is not a wrong password");
     }
 
     #[test]

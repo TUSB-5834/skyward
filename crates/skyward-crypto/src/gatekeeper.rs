@@ -13,6 +13,7 @@
 // The calls and answers serve the phone's own driver and the host tests.
 #![cfg_attr(not(target_os = "android"), allow(dead_code))]
 
+use crate::credential::Rejection;
 use crate::token::Token;
 use anyhow::{bail, Context, Result};
 use skyward_binder::hidl::{Answer, Message};
@@ -35,6 +36,7 @@ const HARDWARE_VERIFY: u32 = 2;
 const RIGHT: i32 = 0;
 const RIGHT_BUT_RENEW: i32 = 1;
 const HOLDING_OFF: i32 = -2;
+const INCORRECT: i32 = -1;
 
 /// The newer kind's own error for a try made while it holds off further
 /// ones. It does not say for how long.
@@ -63,16 +65,17 @@ fn ask(slot: u32, enrolled: &[u8], password: &[u8]) -> Parcel {
 fn note(read: &mut Reader) -> Result<Token> {
     if let Err(e) = status::ok(read) {
         return Err(match status::refused_with(&e) {
-            Some(RETRY_TIMEOUT) => e.context("the phone is holding off further tries"),
-            Some(_) => e.context("the secure world does not recognise that credential"),
-            None => e.context("have the secure world check the credential"),
+            Some(RETRY_TIMEOUT) => e.context(Rejection::Retry { seconds: None, incorrect: false }).context("the phone is holding off further tries"),
+            Some(INCORRECT) => e.context(Rejection::Incorrect).context("the secure world does not recognise that credential"),
+            _ => e.context("have the secure world check the credential"),
         });
     }
     let end = read.structure().context("read what the secure world said about the credential")?;
     // Whether the credential is to be enrolled again, and how long to wait,
     // which a right answer leaves at nothing.
-    read.i32().context("read how the secure world took the credential")?;
-    read.i32().context("read how long the secure world asks to wait")?;
+    let said = read.i32().context("read how the secure world took the credential")?;
+    let wait = read.i32().context("read how long the secure world asks to wait")?;
+    checked(said, wait)?;
     let note = written(read).context("read the note the secure world wrote")?;
     read.go(end)?;
     Ok(note)
@@ -117,16 +120,29 @@ fn hardware_note(read: &mut Answer) -> Result<Token> {
     let said = i32::from_le_bytes(answer[0..4].try_into().expect("four bytes"));
     let wait = i32::from_le_bytes(answer[4..8].try_into().expect("four bytes"));
     let length = u32::from_le_bytes(answer[NOTE_LENGTH].try_into().expect("four bytes"));
-    match said {
-        RIGHT | RIGHT_BUT_RENEW => {}
-        HOLDING_OFF => bail!("the phone is holding off further tries for another {} seconds", (wait + 999) / 1000),
-        _ => bail!("the secure world does not recognise that credential"),
-    }
+    checked(said, wait)?;
     if length == 0 {
         bail!("the secure world took the credential but wrote no note for the key service");
     }
     let note = read.pointed().context("read the note the secure world wrote")?;
     Token::of(note)
+}
+
+/// A successful Binder call can still carry a credential refusal.
+fn checked(said: i32, wait: i32) -> Result<()> {
+    match said {
+        RIGHT | RIGHT_BUT_RENEW => Ok(()),
+        INCORRECT => Err(anyhow::Error::new(Rejection::Incorrect).context("the secure world does not recognise that credential")),
+        HOLDING_OFF => {
+            let seconds = (wait > 0).then(|| (wait as u64).div_ceil(1000));
+            let why = match seconds {
+                Some(seconds) => format!("the phone is holding off further tries for another {seconds} seconds"),
+                None => "the phone is holding off further tries".into(),
+            };
+            Err(anyhow::Error::new(Rejection::Retry { seconds, incorrect: false }).context(why))
+        }
+        _ => bail!("the secure world returned an unknown credential status {said}"),
+    }
 }
 
 /// The phone's credential service, as this program talks to it.
@@ -261,6 +277,25 @@ mod tests {
             token,
             Token { challenge: 0, user: 0x253c_22c3_acbb_a741, authenticator: 9, kind: 1, when: 1_700_000_000, mac: vec![0xAB; 32] }
         );
+    }
+
+    #[test]
+    fn a_binder_success_can_carry_a_wrong_password_or_a_retry() {
+        for (said, wait, expected) in [
+            (INCORRECT, 0, Some(Rejection::Incorrect)),
+            (HOLDING_OFF, 29001, Some(Rejection::Retry { seconds: Some(30), incorrect: false })),
+            (91, 0, None),
+        ] {
+            let mut p = Parcel::default();
+            p.i32(0);
+            structure(&mut p, |p| { p.i32(said); p.i32(wait); });
+            let error = note(&mut Reader::new(p.bytes())).unwrap_err();
+            assert_eq!(crate::credential::rejection(&error), expected);
+        }
+        let error = checked(HOLDING_OFF, i32::MAX).unwrap_err();
+        assert_eq!(crate::credential::rejection(&error), Some(Rejection::Retry { seconds: Some(2147484), incorrect: false }));
+        let error = note(&mut Reader::new(&refused(91))).unwrap_err();
+        assert_eq!(crate::credential::rejection(&error), None);
     }
 
     #[test]
