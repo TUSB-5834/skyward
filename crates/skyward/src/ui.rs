@@ -35,7 +35,7 @@ use skyward_net::wlan::{Power as WlanPower, Stage as Joining};
 use skyward_sys::sleep::{Sleeper, Slept};
 use skyward_sys::uevent;
 use skyward_systems::Who;
-use skyward_ui::aod::{Shown, Want};
+use skyward_ui::aod::Want;
 use skyward_ui::app::{
     App, Asked, AvbStatus, BackupAt, BackupEnd, BackupEntry, BackupRefusal, ClashChoice, Data, DownloadEnd, Effect, EraseStop, FileKind, FileOp,
     FileRow, FileTask, FsAction, FsRow, Have, Held, ItemEnd, ItemState, JobEnd, Keys, MountFailure, Part, PartKind, PartStop, Place,
@@ -1228,6 +1228,15 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     };
     let mut app = App::new(first, w, h, cfg.display.density as f32 / 160.0);
     app.set_screen_corners(cfg.display.corner_radius as f32);
+    let mut gesture = match cfg.touch.xiaomi_double_tap.as_ref().map(crate::touch::Gesture::open).transpose() {
+        Ok(gesture) => gesture,
+        Err(error) => {
+            skyward_sys::kmsg(&format!("native double tap unavailable: {error:#}"))?;
+            None
+        }
+    };
+    app.state.double_taps = gesture.is_some() || (cfg.touch.double_tap && cfg.touch.xiaomi_double_tap.is_none());
+    app.state.double_tap = app.state.double_taps && cfg.touch.double_tap;
     // The settings kept from the starts before are back before the first
     // frame, and before file transfer starts with its switch and the time
     // zone. The pages speak the language chosen then, or else the one the
@@ -1551,6 +1560,13 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     let mut drive_at = Instant::now();
     loop {
         let now = monotonic_ms();
+        if let Some(error) = gesture.as_mut().and_then(|native| native.set(app.state.double_tap).err()) {
+            skyward_sys::kmsg(&format!("native double tap failed: {error:#}"))?;
+            gesture.take();
+            app.state.double_tap = false;
+            app.state.double_taps = false;
+            app.refresh();
+        }
         if leave_at.is_some_and(|at| now >= at) {
             leave_at = None;
             power(leave)?;
@@ -1639,12 +1655,26 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             }
             blanked = false;
         } else if dozes && app.state.always_on {
-            // The face goes on the glass before the panel dozes, and again
-            // each minute: an OLED in its doze shows what the frame holds.
+            // Enter doze on a settled black frame. Showing the white clock
+            // first lets it flash at the page's brightness before the panel
+            // takes its doze brightness. Frames can be updated in doze, as
+            // they are for the clock every minute.
             if !blanked {
+                screen.data.fill(0);
+                surface.present(&screen)?;
+                surface.settle()?;
+                if let Some(b) = backlight.as_mut() {
+                    if let Err(error) = b.show(None) {
+                        let _ = skyward_sys::kmsg(&format!("the backlight before doze is not set: {error:#}"));
+                        backlight = None;
+                    }
+                }
+                if let Some(p) = doze.as_mut() {
+                    p.want(Want::Dark);
+                }
                 faced.clear();
             }
-            if !blanked || faced != shown_clock {
+            if doze.as_ref().is_some_and(aod::Panel::is_dozing) && faced != shown_clock {
                 let facts = skyward_ui::aod::Facts {
                     date: skyward_ui::fmt::date(app.state.lang, unix_now()?, app.state.time_zone),
                     battery: info.battery.as_ref().map(|b| (b.level, b.plugged)),
@@ -1655,11 +1685,6 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                 surface.present(&screen)?;
                 surface.settle()?;
                 faced.clone_from(&shown_clock);
-            }
-            if !blanked && doze.as_mut().is_some_and(|p| p.want(Want::Dark) == Shown::Blank) {
-                screen.data.fill(0);
-                surface.present(&screen)?;
-                surface.settle()?;
             }
             blanked = true;
         } else if !blanked {
@@ -1755,7 +1780,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             && leave_at.is_none()
             && !joining
             && !running
-            && !cfg.touch.double_tap
+            && !(app.state.double_tap && gesture.is_none())
             && asked.is_none()
             && usb_link()? != UsbLink::Connected;
         sleeper.allow(may_sleep);
@@ -2364,6 +2389,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                 Incoming::Input(Event::Touch(t, at)) => app.touch(t, &fonts, at),
                 Incoming::Input(Event::Key(k, true)) => app.key(k, now),
                 Incoming::Input(Event::Key(k, false)) => app.key_up(k, now),
+                Incoming::Input(Event::Wake) => app.gesture_wake(now),
             };
             // What the pages ask for in answer to the work done goes on
             // after it.

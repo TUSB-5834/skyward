@@ -52,6 +52,9 @@ pub struct Settings {
     /// A dark panel keeps the clock and the phone's readings on the glass in
     /// the panel's own doze, rather than being put out.
     pub always_on: bool,
+    /// Missing in older files: use the device's initial choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub double_tap: Option<bool>,
     pub install: Install,
     pub backup: Backup,
     pub logs: Logs,
@@ -130,6 +133,7 @@ impl Settings {
             vibration: state.vibration,
             file_transfer: state.file_transfer,
             always_on: state.always_on,
+            double_tap: Some(state.double_tap),
             install: Install { check_signature: state.check_signature, keep_recovery: state.keep_recovery },
             backup: Backup {
                 parts: names(&state.backup, &PARTS),
@@ -189,6 +193,9 @@ impl Settings {
         }
         state.file_transfer = self.file_transfer;
         state.always_on = self.always_on;
+        if let Some(on) = self.double_tap {
+            state.double_tap = on && state.double_taps;
+        }
         state.check_signature = self.install.check_signature;
         state.keep_recovery = self.install.keep_recovery;
         state.backup = picked(&self.backup.parts, &PARTS);
@@ -300,6 +307,21 @@ impl Keeper {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn double_tap_keeps_the_device_default_for_old_settings_and_remembers_the_switch() {
+        let mut state = State { double_taps: true, double_tap: true, ..State::default() };
+        Settings::read("{}").unwrap().apply(&mut state);
+        assert!(state.double_tap, "an older settings file keeps the device's initial choice");
+        Settings::read(r#"{"double_tap": false}"#).unwrap().apply(&mut state);
+        let saved = Settings::read(&Settings::of(&state).text()).unwrap();
+        state.double_tap = true;
+        saved.apply(&mut state);
+        assert!(!state.double_tap, "the disabled switch survives a restart");
+        state.double_taps = false;
+        Settings::read(r#"{"double_tap": true}"#).unwrap().apply(&mut state);
+        assert!(!state.double_tap, "a kept setting does not invent device support");
+    }
 
     #[test]
     fn the_settings_go_round_through_their_file() {

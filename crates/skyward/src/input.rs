@@ -16,6 +16,24 @@ pub enum Event {
     Touch(Touch, u64),
     /// A button going down, or coming back up.
     Key(Key, bool),
+    /// The touch controller recognized a wake gesture.
+    Wake,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use evdev::EventType;
+
+    #[test]
+    fn a_native_wake_is_one_press_not_a_release_or_repeat() {
+        for value in [0, 1, 2] {
+            let event = InputEvent::new(EventType::KEY.0, KeyCode::KEY_WAKEUP.0, value);
+            assert_eq!(matches!(wake_event(&event), Some(Event::Wake)), value == 1);
+        }
+        let power = InputEvent::new(EventType::KEY.0, KeyCode::KEY_POWER.0, 1);
+        assert!(wake_event(&power).is_none());
+    }
 }
 
 /// Milliseconds on the monotonic clock, which the touch panel stamps its
@@ -35,7 +53,15 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
-const KEYS: [KeyCode; 4] = [KeyCode::KEY_POWER, KeyCode::KEY_VOLUMEUP, KeyCode::KEY_VOLUMEDOWN, KeyCode::KEY_BACK];
+const KEYS: [KeyCode; 5] = [KeyCode::KEY_POWER, KeyCode::KEY_VOLUMEUP, KeyCode::KEY_VOLUMEDOWN, KeyCode::KEY_BACK, KeyCode::KEY_WAKEUP];
+
+fn wake_event(e: &InputEvent) -> Option<Event> {
+    if matches!(e.destructure(), EventSummary::Key(_, KeyCode::KEY_WAKEUP, 1)) {
+        Some(Event::Wake)
+    } else {
+        None
+    }
+}
 
 fn key_of(code: KeyCode) -> Option<Key> {
     match code {
@@ -159,6 +185,7 @@ impl Panel {
                     self.moved = false;
                 }
                 _ if self.dropped => {}
+                EventSummary::Key(_, KeyCode::KEY_WAKEUP, 1) => out.extend(wake_event(&e)),
                 EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_MT_SLOT, v) => self.slot = v,
                 EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_MT_TRACKING_ID, v) if self.slot == 0 => self.down = v >= 0,
                 EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_MT_POSITION_X, v) if self.slot == 0 => {
@@ -309,6 +336,10 @@ impl Inputs {
                     // The kernel's own repeats of a key held are left out;
                     // the UI times its own.
                     for e in events {
+                        if let Some(wake) = wake_event(&e) {
+                            out.push(wake);
+                            continue;
+                        }
                         if let EventSummary::Key(_, code, value @ (0 | 1)) = e.destructure() {
                             if let Some(k) = key_of(code) {
                                 out.push(Event::Key(k, value == 1));

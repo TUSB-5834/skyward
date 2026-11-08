@@ -404,13 +404,19 @@ pub struct Touch {
     /// step of starting the controller.
     #[serde(default)]
     pub writes: Vec<Write>,
-    /// Whether two taps on the dark panel light it, as the phone's own
-    /// system's double tap does. A phone whose panel goes dark but whose
-    /// controller keeps reporting taps is one this is worth setting on: the
-    /// recovery then keeps the phone awake while the panel is off, since a
-    /// suspended phone is one the touchscreen cannot report a tap to.
+    /// Enable double tap by default. Without a native gesture interface,
+    /// this needs coordinates while dark and keeps the phone out of suspend.
     #[serde(default)]
     pub double_tap: bool,
+    /// The Xiaomi touch driver's common-data ABI, whose double-tap mode
+    /// reports KEY_WAKEUP even while coordinates are stopped.
+    pub xiaomi_double_tap: Option<XiaomiDoubleTap>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct XiaomiDoubleTap {
+    pub path: String,
+    pub touch_id: i8,
 }
 
 /// Partitions as the phone itself mounts them.
@@ -609,6 +615,10 @@ impl DeviceConfig {
 
     pub fn parse(text: &str) -> Result<Self> {
         let cfg: DeviceConfig = toml::from_str(text).context("parse device config")?;
+        if let Some(gesture) = &cfg.touch.xiaomi_double_tap {
+            ensure!(Path::new(&gesture.path).has_root() && gesture.touch_id >= 0,
+                "[touch.xiaomi_double_tap] needs an absolute path and a nonnegative touch_id");
+        }
         if cfg.display.spr == Some(Spr::DadaO3) {
             ensure!(cfg.device.codename == "dada" && (cfg.display.width, cfg.display.height) == (1200, 2670),
                 "[display] dada-o3 SPR requires dada at 1200x2670");
@@ -1242,6 +1252,11 @@ mod tests {
         let enabled = format!("{base}\n[touch]\ndouble_tap = true\n");
         assert!(DeviceConfig::parse(&enabled).unwrap().touch.double_tap);
         assert!(DeviceConfig::parse(&format!("{base}\n[touch.double_tap]\n")).is_err());
+        let dada = DeviceConfig::parse(include_str!("../../../devices/dada.toml")).unwrap();
+        assert!(dada.touch.double_tap);
+        let native = dada.touch.xiaomi_double_tap.unwrap();
+        assert_eq!((native.path.as_str(), native.touch_id), ("/dev/xiaomi-touch", 0));
+        assert!(DeviceConfig::parse(&format!("{base}\n[touch.xiaomi_double_tap]\npath = \"dev/xiaomi-touch\"\ntouch_id = 0\n")).is_err());
     }
 
 }

@@ -413,6 +413,14 @@ pub fn settings(cx: &Ctx) -> Frame {
         ]);
         y = widgets::footnote(&mut c, t, f, aod.bottom, note);
     }
+    if s.double_taps {
+        let gesture = widgets::list(&mut c, t, f, y, &[
+            Row::new(l.pick(["双击唤醒", "點兩下喚醒", "Double tap to wake"]))
+                .icon(BLUE, Icon::Power).trail(Trail::Switch(s.double_tap)),
+        ]);
+        out.extend(hits(&gesture.rows, &[Action::Toggle(Switch::DoubleTap)]));
+        y = gesture.bottom;
+    }
     y = widgets::section(&mut c, t, f, y, l.pick(["通用", "一般", "General"]));
     let general = widgets::list(&mut c, t, f, y, &[
         Row::new(l.pick(LANGUAGE)).icon(BLUE, Icon::Globe).trail(Trail::Value(l.name())),

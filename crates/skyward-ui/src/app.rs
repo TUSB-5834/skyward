@@ -563,6 +563,7 @@ pub enum Switch {
     /// Show the clock and the phone's readings on a dark panel, in the
     /// panel's own doze, rather than putting the panel out.
     AlwaysOn,
+    DoubleTap,
     /// Show the password typed rather than a dot for each character.
     ShowPassword,
 }
@@ -1621,6 +1622,9 @@ pub struct State {
     /// This phone's panel has a doze of its own, which the settings page then
     /// offers a switch for.
     pub panel_dozes: bool,
+    /// This phone can wake from two taps, and whether the user enabled it.
+    pub double_taps: bool,
+    pub double_tap: bool,
     pub reboot: usize,
     /// What the wipe page has chosen, by place in [`WIPES`].
     pub wipe: [bool; WIPES.len()],
@@ -1807,6 +1811,8 @@ impl Default for State {
             file_transfer: true,
             always_on: true,
             panel_dozes: false,
+            double_taps: false,
+            double_tap: false,
             reboot: 0,
             wipe: [false; WIPES.len()],
             cache_partition: false,
@@ -1991,6 +1997,8 @@ pub struct Tap {
 }
 
 impl Tap {
+    /// A held finger is not a tap.
+    pub const MAX_MS: u64 = 180;
     /// How long after a tap another may come and still be the second of a
     /// double tap: Android's own window.
     pub const WINDOW_MS: u64 = 300;
@@ -2775,6 +2783,8 @@ pub struct App {
     /// The last tap on a dark panel and when it came, for the second tap of
     /// a double tap to find.
     tapped: Option<(Tap, u64)>,
+    /// A potential tap, until it lifts without dragging or holding.
+    dark_touch: Option<(Tap, u64)>,
     /// The panel at full brightness, or easing to the dim level it takes
     /// shortly before going off.
     bright: Fade,
@@ -2873,6 +2883,7 @@ impl App {
             active: None,
             woke_at: None,
             tapped: None,
+            dark_touch: None,
             bright: full_brightness(),
             curtain: Fade::shown(BRIGHTEN, DARKEN),
             darkening: None,
@@ -3243,10 +3254,21 @@ impl App {
         }
         self.woke_at = Some(now);
         self.tapped = None;
+        self.dark_touch = None;
         self.stir(now);
     }
 
-    /// A finger came down on the dark panel: the second of two taps that land
+    /// A native double-tap report only lights a dark panel. It never acts
+    /// like the power key, which would turn an already lit panel off.
+    pub fn gesture_wake(&mut self, now: u64) -> Vec<Effect> {
+        if self.state.double_tap && !self.display_on {
+            self.wake(now);
+            self.drag = Drag::Waking;
+        }
+        Vec::new()
+    }
+
+    /// A completed tap on the dark panel: the second of two taps that land
     /// near each other, soon enough, lights it, as the phone's own double tap
     /// does. One that comes later than the window is a tap of its own and
     /// starts the count again.
@@ -3315,6 +3337,8 @@ impl App {
     /// now, then the panel goes off. A finger on the glass lets go of what
     /// it held, and the page stops where it is.
     fn sleep(&mut self, now: u64) {
+        self.tapped = None;
+        self.dark_touch = None;
         self.darkening = self.panel(now);
         self.curtain.set(false, now);
         self.display_on = false;
@@ -5451,10 +5475,15 @@ impl App {
                     Switch::KeepRecovery => &mut self.state.keep_recovery,
                     Switch::ShowPassword => &mut self.state.show_password,
                     Switch::AlwaysOn => &mut self.state.always_on,
+                    Switch::DoubleTap => &mut self.state.double_tap,
                     Switch::Wlan => unreachable!("the WLAN switch is turned above"),
                 };
                 *on = !*on;
                 let now_on = *on;
+                if switch == Switch::DoubleTap {
+                    self.tapped = None;
+                    self.dark_touch = None;
+                }
                 self.refresh();
                 if switch == Switch::FileTransfer {
                     return vec![Effect::FileTransfer(now_on)];
@@ -6248,8 +6277,30 @@ impl App {
         // second tap where the first one landed lights it, which is that
         // system's own double tap. Neither tap works anything on the page.
         if !self.display_on {
-            if let Touch::Down(x, y) = ev {
-                self.tap(now, x, y);
+            if !self.state.double_tap {
+                self.tapped = None;
+                self.dark_touch = None;
+                return Vec::new();
+            }
+            match ev {
+                Touch::Down(x, y) => self.dark_touch = Some((Tap { x, y }, now)),
+                Touch::Move(x, y) => {
+                    let slop = self.theme().m.dp(8.0);
+                    if self.dark_touch.is_some_and(|(start, at)| now.saturating_sub(at) > Tap::MAX_MS
+                        || (x - start.x).abs() > slop || (y - start.y).abs() > slop) {
+                        self.dark_touch = None;
+                        self.tapped = None;
+                    }
+                }
+                Touch::Up => {
+                    if let Some((tap, at)) = self.dark_touch.take() {
+                        if now.saturating_sub(at) <= Tap::MAX_MS {
+                            self.tap(now, tap.x, tap.y);
+                        } else {
+                            self.tapped = None;
+                        }
+                    }
+                }
             }
             return Vec::new();
         }
@@ -11927,6 +11978,7 @@ mod tests {
     fn two_taps_on_the_dark_panel_light_it() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Home, W, H, PPD);
+        app.state.double_tap = true;
         let (x, y) = spot(&mut app, &f, &i, Action::Open(Screen::Settings));
         press(&mut app, Key::Power, 0);
         for (at, lit) in [(100, false), (200, true)] {
@@ -11938,7 +11990,7 @@ mod tests {
         assert_eq!(app.panel(320), Some(SLIDER_START), "and the panel comes up at full brightness");
         // The next tap, past the guard that keeps a touch just after the panel
         // lit from acting, works the page.
-        let after = 200 + WAKE_GUARD_MS + 10;
+        let after = 220 + WAKE_GUARD_MS + 10;
         app.touch(Touch::Down(x, y), &f, after);
         app.touch(Touch::Up, &f, after + 20);
         assert_eq!(app.screen(), Screen::Settings);
@@ -11951,6 +12003,7 @@ mod tests {
     fn taps_too_far_apart_or_too_late_do_not_light_the_panel() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Home, W, H, PPD);
+        app.state.double_tap = true;
         let (x, y) = spot(&mut app, &f, &i, Action::Open(Screen::Settings));
         press(&mut app, Key::Power, 0);
         // Too late: the window the first tap opened has gone by.
@@ -11960,13 +12013,68 @@ mod tests {
         app.touch(Touch::Up, &f, 100 + Tap::WINDOW_MS + 70);
         assert!(!app.display_on(), "a tap past the window starts a count of its own");
         // Too far: the tap after it lands elsewhere on the glass.
-        let far = W as f32 * (Tap::SLOP + 0.05);        app.touch(Touch::Down(x + far, y), &f, 100 + Tap::WINDOW_MS + 100);
+        let far = W as f32 * (Tap::SLOP + 0.05);
+        app.touch(Touch::Down(x + far, y), &f, 100 + Tap::WINDOW_MS + 100);
         app.touch(Touch::Up, &f, 100 + Tap::WINDOW_MS + 120);
         assert!(!app.display_on(), "a tap far from the last is not its pair");
         // The two that are both soon and close do light it.
         app.touch(Touch::Down(x + far, y), &f, 100 + Tap::WINDOW_MS + 150);
         app.touch(Touch::Up, &f, 100 + Tap::WINDOW_MS + 170);
         assert!(app.display_on());
+    }
+
+    #[test]
+    fn double_tap_switch_blocks_both_native_and_coordinate_wake() {
+        let f = fonts();
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        press(&mut app, Key::Power, 0);
+        for at in [100, 200] {
+            app.touch(Touch::Down(100.0, 100.0), &f, at);
+            app.touch(Touch::Up, &f, at + 20);
+        }
+        app.gesture_wake(300);
+        assert!(!app.display_on());
+        app.act(Action::Toggle(Switch::DoubleTap), 400);
+        app.gesture_wake(500);
+        assert!(app.display_on());
+        app.gesture_wake(1000);
+        assert!(app.display_on(), "a repeated wake never turns a lit panel off");
+        assert_eq!(app.woke_at, Some(500), "nor does it renew the touch guard");
+    }
+
+    #[test]
+    fn a_drag_or_long_press_is_not_a_dark_panel_tap() {
+        let f = fonts();
+        for dragged in [true, false] {
+            let mut app = App::new(Screen::Home, W, H, PPD);
+            app.state.double_tap = true;
+            press(&mut app, Key::Power, 0);
+            for at in [100, 500] {
+                app.touch(Touch::Down(100.0, 100.0), &f, at);
+                if dragged {
+                    app.touch(Touch::Move(200.0, 100.0), &f, at + 20);
+                }
+                app.touch(Touch::Up, &f, at + if dragged { 40 } else { Tap::MAX_MS + 1 });
+                app.touch(Touch::Down(100.0, 100.0), &f, at + 200);
+                app.touch(Touch::Up, &f, at + 220);
+                assert!(!app.display_on(), "dragged={dragged}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_native_wake_keeps_the_waking_finger_off_the_page() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.state.double_tap = true;
+        let (x, y) = spot(&mut app, &f, &i, Action::Open(Screen::Settings));
+        press(&mut app, Key::Power, 0);
+        app.gesture_wake(100);
+        app.touch(Touch::Down(x, y), &f, 110);
+        app.touch(Touch::Up, &f, 120);
+        assert_eq!(app.screen(), Screen::Home);
+        tap_at(&mut app, &f, &i, Action::Open(Screen::Settings), 100 + WAKE_GUARD_MS + 10);
+        assert_eq!(app.screen(), Screen::Settings);
     }
 
     #[test]

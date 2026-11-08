@@ -45,14 +45,15 @@ group = "nfc"
 mode = 0o660
 paths = ["/dev/st21nfc"]
 
-# As on the 17 Ultra, no init script of the phone's starts touch_report:
-# the touch feature service turns the controller's raw frames into
-# touches with /odm/lib64/libtouchreport.so, and a recovery runs none of
-# it. Told through Xiaomi's touch layer, the driver has the controller
-# report positions itself; that is known of the 17 Ultra's Synaptics
-# controller and not yet tried on this phone's.
+# Use coordinates processed by the controller, without Android's raw-frame
+# touch service. Native double tap uses the Xiaomi common-data interface.
 [touch]
+double_tap = true
 writes = [{ path = "/sys/class/touch/touch_dev/enable_touch_raw", value = "0" }]
+
+[touch.xiaomi_double_tap]
+path = "/dev/xiaomi-touch"
+touch_id = 0
 
 # What the phone's own init runs once the system has finished starting, as
 # kernel-post-boot in /vendor/etc/init/hw/init.qti.kernel.rc. The kernel
