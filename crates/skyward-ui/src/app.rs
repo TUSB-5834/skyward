@@ -21,6 +21,7 @@ use crate::tr;
 use crate::widgets::{self, Bar, Bolt, Cap, Layer, WlanMark};
 use skyward_info::DeviceInfo;
 use skyward_install::{Event, ImageKind, Outcome, Reflash, Refusal, Stage};
+use skyward_install::avb::{Checks as AvbChecks, State as AvbPartition};
 use skyward_net::download::{Failure, Progress};
 use skyward_net::github::{Build, Newest};
 use skyward_net::release::{Release, Unanswered};
@@ -61,6 +62,8 @@ pub enum Screen {
     BackupJob,
     /// Tools for the experienced: files, a terminal, the logs.
     Advanced,
+    /// The top-level vbmeta checks and a swipe to disable the chosen ones.
+    Avb,
     Files,
     /// One file, and what can be done with it.
     FileInfo,
@@ -850,6 +853,7 @@ pub enum Confirm {
     Restore,
     /// Start next from the slot chosen on the slot page.
     Slot,
+    DisableAvb,
     /// Erase all user data, as the system offered when it could not start.
     FactoryReset,
     /// Delete the entry the file page shows.
@@ -1182,6 +1186,8 @@ pub enum Action {
     ExportLogs,
     /// Pick this slot to start next; a swipe then switches to it.
     PickSlot(Slot),
+    /// Toggle verity (`true`) or boot verification (`false`) on the AVB page.
+    AvbCheck(bool),
     /// A key of the on-screen keyboard.
     Type(Cap),
     /// A key of the row above the keyboard, the terminal's or the editor's.
@@ -1526,6 +1532,12 @@ impl Frame {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AvbStatus {
+    pub unlocked: bool,
+    pub partitions: Vec<AvbPartition>,
+}
+
 /// Choices the pages show and the user changes, and where installing
 /// stands.
 #[derive(Clone, Debug, PartialEq)]
@@ -1615,6 +1627,9 @@ pub struct State {
     /// The slot picked on the slot page to start next; with none picked,
     /// the page shows the one the boot control starts next.
     pub next_slot: Option<Slot>,
+    pub avb: Option<Result<AvbStatus, String>>,
+    pub avb_checks: AvbChecks,
+    pub avb_result: Option<Result<(), String>>,
     /// Where the data partition stands, and what is typed at the screen
     /// lock its users' own files wait on.
     pub data: Data,
@@ -1752,6 +1767,9 @@ impl Default for State {
             logs_to: 0,
             boot_slots: None,
             next_slot: None,
+            avb: None,
+            avb_checks: AvbChecks::default(),
+            avb_result: None,
             data: Data::Closed,
             code: String::new(),
             others: Vec::new(),
@@ -1942,6 +1960,8 @@ pub enum Effect {
     /// Have the bootloader start this slot next, telling how it went with
     /// [`App::slot_switched`].
     SetSlot(Slot),
+    ReadAvb,
+    DisableAvb(AvbChecks),
     /// Mount the slot's partition with this base name, such as `system`.
     Mount(String),
     /// Unmount the slot's partition with this base name.
@@ -3827,6 +3847,22 @@ impl App {
         self.refresh();
     }
 
+    pub fn set_avb(&mut self, status: Result<AvbStatus, String>) {
+        self.state.avb = Some(status);
+        self.refresh();
+    }
+
+    pub fn avb_disabled(&mut self, result: Result<AvbStatus, String>) {
+        match result {
+            Ok(status) => {
+                self.state.avb = Some(Ok(status));
+                self.state.avb_result = Some(Ok(()));
+            }
+            Err(why) => self.state.avb_result = Some(Err(why)),
+        }
+        self.refresh();
+    }
+
     /// How switching the slot to start next went: what the boot control
     /// holds of the slots now, or why it did not switch.
     pub fn slot_switched(&mut self, outcome: Result<BootSlots, String>, now: u64) {
@@ -4725,6 +4761,7 @@ impl App {
             Screen::Mount => self.state.mount_failure = None,
             // A slot picked and not switched to is put down.
             Screen::Slot => self.state.next_slot = None,
+            Screen::Avb => self.state.avb_result = None,
             Screen::Files => {
                 if let Some(up) = self.state.files.up() {
                     return vec![Effect::ReadDir(up)];
@@ -4976,6 +5013,7 @@ impl App {
             Screen::Mount => vec![Effect::ReadMounts],
             Screen::Filesystems => vec![Effect::ReadFilesystems],
             Screen::Slot | Screen::Reboot => vec![Effect::ReadSlots],
+            Screen::Avb => vec![Effect::ReadAvb],
             Screen::Restore => vec![self.find_backups()],
             Screen::Files => vec![Effect::ReadDir(self.state.files.path.clone())],
             Screen::Choose(place) if self.state.place_open(place) => vec![Effect::ReadPlace(place, self.state.folder(s).path.clone())],
@@ -5319,6 +5357,12 @@ impl App {
             }
             Action::PickSlot(slot) => {
                 self.state.next_slot = Some(slot);
+                self.refresh();
+            }
+            Action::AvbCheck(verity) => {
+                let chosen = if verity { &mut self.state.avb_checks.verity } else { &mut self.state.avb_checks.verification };
+                *chosen = !*chosen;
+                self.state.avb_result = None;
                 self.refresh();
             }
             Action::Type(cap) if self.screen() == Screen::Terminal => return self.term_typed(cap),
@@ -6415,6 +6459,16 @@ impl App {
                 }
                 _ => self.say(l.pick(["无法读取启动槽位", "無法讀取啟動槽位", "Couldn't read the boot slots"]), now),
             },
+            Confirm::DisableAvb => {
+                let checks = self.state.avb_checks;
+                if checks.mask() == 0 {
+                    self.say(l.pick(["请选择要禁用的验证", "請選擇要停用的驗證", "Choose the checks to disable"]), now);
+                } else if self.state.avb.as_ref().is_some_and(|s| s.as_ref().is_ok_and(|s| s.unlocked)) {
+                    fx.push(Effect::DisableAvb(checks));
+                } else {
+                    self.say(l.pick(["无法禁用，请确认 Bootloader 已解锁且 AVB 状态可读取", "無法停用，請確認 Bootloader 已解鎖且 AVB 狀態可讀取", "An unlocked bootloader and readable AVB state are required"]), now);
+                }
+            }
             Confirm::FactoryReset => fx.push(Effect::FactoryReset),
             Confirm::Merge => {
                 if self.state.update == Standing::Waiting {

@@ -8,28 +8,14 @@
 
 use super::Io;
 use std::ffi::OsString;
-use std::fs::{File, OpenOptions};
-use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::Path;
 
 /// How avbctl ends, numbered as sysexits.h numbers them.
 const DONE: i32 = 0;
 const MISUSED: i32 = 64;
 const FAILED: i32 = 70;
 const REFUSED: i32 = 77;
-
-/// A vbmeta image's header: 256 bytes starting with its magic, its flags a
-/// big-endian 32-bit word 120 bytes in.
-const HEADER_LEN: usize = 256;
-const MAGIC: &[u8] = b"AVB0";
-const FLAGS_AT: usize = 120;
-
-/// The footer ending a partition whose image carries its vbmeta image
-/// along: 64 bytes starting with its magic, where the vbmeta image starts
-/// in the partition a big-endian 64-bit word 20 bytes in.
-const FOOTER_LEN: usize = 64;
-const FOOTER_MAGIC: &[u8] = b"AVBf";
-const VBMETA_AT: usize = 20;
 
 const USAGE: &str = "\
 avbctl - command-line tool for AVB.
@@ -158,63 +144,12 @@ fn say(io: &mut Io, text: &str) -> i32 {
 
 /// Whether `check` is on in the slot's top-level vbmeta image.
 fn is_on(phone: &Phone, check: Check) -> io::Result<bool> {
-    let (path, at) = top_level(phone)?;
-    let mut file = File::open(&path).map_err(|e| about(&path, e))?;
-    let header = header(&mut file, &path, at)?;
-    Ok(flags(&header) & check.off() == 0)
+    Ok(crate::avb::read(phone.by_name, phone.suffix)?.flags & check.off() == 0)
 }
 
-/// Turn `check` on or off in the slot's top-level vbmeta image, leaving the
-/// rest of it as it was.
+/// Share the checked, four-byte vbmeta writer with the recovery's AVB page.
 fn set(phone: &Phone, check: Check, on: bool) -> io::Result<()> {
-    let (path, at) = top_level(phone)?;
-    let mut file = OpenOptions::new().read(true).write(true).open(&path).map_err(|e| about(&path, e))?;
-    let mut header = header(&mut file, &path, at)?;
-    let flags = match on {
-        true => flags(&header) & !check.off(),
-        false => flags(&header) | check.off(),
-    };
-    header[FLAGS_AT..FLAGS_AT + 4].copy_from_slice(&flags.to_be_bytes());
-    file.seek(SeekFrom::Start(at)).and_then(|_| file.write_all(&header)).and_then(|()| file.sync_all()).map_err(|e| about(&path, e))
-}
-
-/// Where the slot's top-level vbmeta image starts: at the start of its
-/// vbmeta partition, or, on a phone without one, in its boot partition
-/// where the footer ending it says.
-fn top_level(phone: &Phone) -> io::Result<(PathBuf, u64)> {
-    let vbmeta = phone.by_name.join(format!("vbmeta{}", phone.suffix));
-    if vbmeta.exists() {
-        return Ok((vbmeta, 0));
-    }
-    let boot = phone.by_name.join(format!("boot{}", phone.suffix));
-    let mut file = File::open(&boot).map_err(|e| about(&boot, e))?;
-    let mut footer = [0; FOOTER_LEN];
-    file.seek(SeekFrom::End(-(FOOTER_LEN as i64))).and_then(|_| file.read_exact(&mut footer)).map_err(|e| about(&boot, e))?;
-    if !footer.starts_with(FOOTER_MAGIC) {
-        let why = format!("there is no {}, and {} does not end in a vbmeta footer", vbmeta.display(), boot.display());
-        return Err(io::Error::new(ErrorKind::InvalidData, why));
-    }
-    let at = u64::from_be_bytes(footer[VBMETA_AT..VBMETA_AT + 8].try_into().expect("eight bytes"));
-    Ok((boot, at))
-}
-
-/// The vbmeta header `at` bytes into `file`, the partition at `path`.
-fn header(file: &mut File, path: &Path, at: u64) -> io::Result<[u8; HEADER_LEN]> {
-    let mut header = [0; HEADER_LEN];
-    file.seek(SeekFrom::Start(at)).and_then(|_| file.read_exact(&mut header)).map_err(|e| about(path, e))?;
-    if !header.starts_with(MAGIC) {
-        return Err(io::Error::new(ErrorKind::InvalidData, format!("{} holds no vbmeta header {at} bytes in", path.display())));
-    }
-    Ok(header)
-}
-
-fn flags(header: &[u8; HEADER_LEN]) -> u32 {
-    u32::from_be_bytes(header[FLAGS_AT..FLAGS_AT + 4].try_into().expect("four bytes"))
-}
-
-/// `e`, saying which partition it came from.
-fn about(path: &Path, e: io::Error) -> io::Error {
-    io::Error::new(e.kind(), format!("{}: {e}", path.display()))
+    crate::avb::set(phone.by_name, phone.suffix, check.off(), on).map(|_| ())
 }
 
 #[cfg(test)]

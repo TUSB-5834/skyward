@@ -79,6 +79,7 @@ pub fn render(screen: Screen, cx: &Ctx) -> Frame {
         Screen::RestoreBackup => restore_backup(cx),
         Screen::BackupJob => backup_job(cx),
         Screen::Advanced => advanced(cx),
+        Screen::Avb => avb(cx),
         Screen::Files => files(cx),
         Screen::FileInfo => file_info(cx),
         Screen::Permissions => permissions(cx),
@@ -125,6 +126,7 @@ pub fn confirm_label(which: Confirm, s: &State) -> (&'static str, bool) {
         Confirm::Backup => (["滑动以备份", "滑動以備份", "Slide to back up"], false),
         Confirm::Restore => (["滑动以恢复", "滑動以還原", "Slide to restore"], true),
         Confirm::Slot => (["滑动以切换", "滑動以切換", "Slide to switch"], true),
+        Confirm::DisableAvb => (["滑动以禁用", "滑動以停用", "Slide to disable"], true),
         Confirm::FactoryReset => (["滑动以恢复出厂设置", "滑動以恢復原廠設定", "Slide to factory reset"], true),
         Confirm::DeleteEntry | Confirm::DeleteBackup => (["滑动以删除", "滑動以刪除", "Slide to delete"], true),
         Confirm::Install => (INSTALL, false),
@@ -2191,6 +2193,7 @@ pub fn advanced(cx: &Ctx) -> Frame {
     let tools = widgets::list(&mut c, t, f, top, &[
         Row::new(l.pick(FILES)).icon(BLUE, Icon::Folder),
         Row::new(l.pick(TERMINAL)).icon(SLATE, Icon::Terminal),
+        Row::new(l.pick(DISABLE_AVB)).icon(ORANGE, Icon::Shield),
         Row::new(l.pick(RELABEL)).icon(PURPLE, Icon::Shield),
         Row::new(l.pick(FILESYSTEMS)).icon(RED, Icon::Mount),
         Row::new(l.pick(LOGS)).icon(ORANGE, Icon::Log),
@@ -2199,6 +2202,7 @@ pub fn advanced(cx: &Ctx) -> Frame {
     let out = hits(&tools.rows, &[
         Action::Open(Screen::Files),
         Action::Open(Screen::Terminal),
+        Action::Open(Screen::Avb),
         Action::Open(Screen::Relabel),
         Action::Open(Screen::Filesystems),
         Action::Open(Screen::Logs),
@@ -2208,6 +2212,74 @@ pub fn advanced(cx: &Ctx) -> Frame {
 }
 
 const RELABEL: Text = ["修复 SELinux 上下文", "修復 SELinux 上下文", "Fix SELinux contexts"];
+const DISABLE_AVB: Text = ["禁用 AVB", "停用 AVB", "Disable AVB"];
+
+/// TWRP's manual AVB action: show every target, choose the checks, then swipe.
+pub fn avb(cx: &Ctx) -> Frame {
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    let mut c = long_page(cx);
+    let mut out = Vec::new();
+    let top = t.m.content_top;
+    let title = l.pick(DISABLE_AVB);
+    let status = match &s.avb {
+        Some(Ok(status)) => status,
+        Some(Err(why)) => {
+            let list = widgets::list(&mut c, t, f, top, &[Row::new(l.pick(["无法读取 AVB 状态", "無法讀取 AVB 狀態", "Couldn't read AVB state"])).trail(Trail::None)]);
+            widgets::footnote(&mut c, t, f, list.bottom, why);
+            return Frame::new(t, c, out, title, top);
+        }
+        None => return Frame::new(t, c, out, title, top),
+    };
+    let enabled = |on| l.pick(if on { ["已启用", "已啟用", "Enabled"] } else { ["已禁用", "已停用", "Disabled"] });
+    let descriptions: Vec<String> = status.partitions.iter().map(|p| {
+        let (verity, verification) = (enabled(p.verity_enabled()), enabled(p.verification_enabled()));
+        tr!(l, "dm-verity {verity} · 启动验证 {verification}", "dm-verity {verity} · 啟動驗證 {verification}", "dm-verity {verity} · boot verification {verification}")
+    }).collect();
+    let rows: Vec<Row> = status.partitions.iter().zip(&descriptions).map(|(p, d)| Row::new(&p.partition).subtitle(d).trail(Trail::None)).collect();
+    let y = widgets::section_first(&mut c, t, f, top, l.pick(["目标分区", "目標分割區", "Target partitions"]));
+    let partitions = widgets::list(&mut c, t, f, y, &rows);
+    let y = widgets::section(&mut c, t, f, partitions.bottom, l.pick(["要禁用的验证", "要停用的驗證", "Checks to disable"]));
+    let choices = widgets::list(&mut c, t, f, y, &[
+        Row::new(l.pick(["禁用 dm-verity", "停用 dm-verity", "Disable dm-verity"]))
+            .subtitle(l.pick(["停止检查系统分区的数据块", "停止檢查系統分割區的資料區塊", "Stops checking system partition data blocks"]))
+            .trail(Trail::Switch(s.avb_checks.verity)),
+        Row::new(l.pick(["禁用启动验证", "停用啟動驗證", "Disable boot verification"]))
+            .subtitle(l.pick(["跳过 Bootloader 的分区验证", "略過 Bootloader 的分割區驗證", "Skips the bootloader's partition verification"]))
+            .trail(Trail::Switch(s.avb_checks.verification)),
+    ]);
+    out.extend(hits(&choices.rows, &[Action::AvbCheck(true), Action::AvbCheck(false)]));
+    let note = l.pick([
+        "修改上列分区的验证标记，重启后生效。A/B 设备会处理两个槽位；完整系统更新可能恢复验证。",
+        "修改上列分割區的驗證標記，重新啟動後生效。A/B 裝置會處理兩個槽位；完整系統更新可能恢復驗證。",
+        "Changes the listed partitions' verification flags, effective after reboot. Both slots are handled on A/B devices; a full system update may restore verification.",
+    ]);
+    let mut y = widgets::footnote(&mut c, t, f, choices.bottom, note);
+    if let Some(result) = &s.avb_result {
+        let message = match result {
+            Ok(()) => l.pick(["所选验证已禁用，重启后生效。", "所選驗證已停用，重新啟動後生效。", "Selected checks disabled; reboot for them to take effect."]).to_string(),
+            Err(why) => tr!(l, "禁用失败：{why}", "停用失敗：{why}", "Couldn't disable: {why}"),
+        };
+        y = widgets::footnote(&mut c, t, f, y, &message);
+    }
+    let blocked = if !status.unlocked {
+        Some(l.pick(["Bootloader 未解锁或状态未知，无法修改。", "Bootloader 未解鎖或狀態未知，無法修改。", "The bootloader is locked or its state is unknown; changes are unavailable."]))
+    } else if cx.info.snapshot != skyward_vab::SnapshotState::None {
+        Some(l.pick(["系统更新未完成或状态未知，暂不能修改 AVB。", "系統更新未完成或狀態未知，暫不能修改 AVB。", "AVB cannot change while a system update is pending or its state is unknown."]))
+    } else {
+        None
+    };
+    if let Some(why) = blocked {
+        widgets::footnote(&mut c, t, f, y, &why);
+    } else if s.avb_checks.mask() != 0 && status.partitions.iter().any(|p| p.flags & s.avb_checks.mask() != s.avb_checks.mask()) {
+        let (label, danger) = confirm_label(Confirm::DisableAvb, s);
+        let track = widgets::confirm(&mut c, t, f, y + t.m.dp(24.0), label, danger, s.confirm);
+        out.push(Hit { rect: track, action: Action::Confirm(Confirm::DisableAvb) });
+    } else {
+        let note = if s.avb_checks.mask() == 0 { ["请选择要禁用的验证。", "請選擇要停用的驗證。", "Choose the checks to disable."] } else { ["所选验证已禁用。", "所選驗證已停用。", "Selected checks are already disabled."] };
+        widgets::footnote(&mut c, t, f, y, l.pick(note));
+    }
+    Frame::new(t, c, out, title, top)
+}
 const FILESYSTEMS: Text = ["文件系统", "檔案系統", "Filesystems"];
 const STOPPED: Text = ["已停止", "已停止", "Stopped"];
 const STOPPING: Text = ["正在停止", "正在停止", "Stopping"];

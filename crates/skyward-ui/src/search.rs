@@ -40,6 +40,7 @@ pub const ENTRIES: &[Entry] = &[
     entry(ADVANCED, HOME, Screen::Advanced, &["gaoji", "gj", "advanced"]),
     entry(["文件管理", "檔案管理", "File manager"], ADVANCED, Screen::Files, &["wenjianguanli", "wjgl", "files", "file"]),
     entry(["终端", "終端機", "Terminal"], ADVANCED, Screen::Terminal, &["zhongduan", "zd", "terminal", "shell"]),
+    entry(["禁用 AVB", "停用 AVB", "Disable AVB"], ADVANCED, Screen::Avb, &["jinyongavb", "jyavb", "avb", "verity", "vbmeta", "verification"]),
     entry(
         ["修复 SELinux 上下文", "修復 SELinux 上下文", "Fix SELinux contexts"],
         ADVANCED,

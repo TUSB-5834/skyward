@@ -21,7 +21,7 @@ use skyward_block::{fstab, mount, probe};
 use skyward_config::{DeviceConfig, Service};
 use skyward_crypto::data::{Closed, Opened};
 use skyward_install::asked::{self, Needs};
-use skyward_install::{Detach, Installer, Options};
+use skyward_install::{avb, Detach, Installer, Options};
 use skyward_sys::bcb::{self, Work, REFORMATS};
 use skyward_sys::control::{Control, Request};
 use skyward_sys::Power;
@@ -35,7 +35,7 @@ use skyward_sys::sleep::{Sleeper, Slept};
 use skyward_sys::uevent;
 use skyward_ui::aod::{Shown, Want};
 use skyward_ui::app::{
-    App, Asked, BackupAt, BackupEnd, BackupEntry, BackupRefusal, ClashChoice, Data, DownloadEnd, Effect, EraseStop, FileKind, FileOp,
+    App, Asked, AvbStatus, BackupAt, BackupEnd, BackupEntry, BackupRefusal, ClashChoice, Data, DownloadEnd, Effect, EraseStop, FileKind, FileOp,
     FileRow, FileTask, FsAction, FsRow, Have, Held, ItemEnd, ItemState, JobEnd, Keys, MountFailure, Part, PartKind, PartStop, Place,
     RenameRefused, Screen, Shot, SkywardEnd, SkywardStage, Target, UsbDrive, UsbLink, Wipe, DATA_OPENING, DATA_PARTITION, DOWNLOADS,
     INSTALL_UNFINISHED, USB_DRIVE,
@@ -1021,6 +1021,45 @@ fn read_slots() -> Result<skyward_vab::BootSlots, String> {
         control.slots()
     };
     read().map_err(|e| format!("{e:#}"))
+}
+
+fn avb_suffixes(cfg: &DeviceConfig) -> &'static [&'static str] {
+    if cfg.device.ab { &["_a", "_b"] } else { &[""] }
+}
+
+/// Use the kernel's boot parameters first, as property overrides can change
+/// ro.boot.* while the recovery runs. Unknown and locked states both refuse.
+fn avb_unlocked() -> Result<bool> {
+    let state = skyward_block::boot_param("androidboot.vbmeta.device_state")?
+        .or_else(|| skyward_sys::prop("ro.boot.vbmeta.device_state"));
+    let locked = skyward_block::boot_param("androidboot.flash.locked")?
+        .or_else(|| skyward_sys::prop("ro.boot.flash.locked"));
+    Ok(match state.as_deref() {
+        Some("locked") => false,
+        Some("unlocked") => locked.as_deref() != Some("1"),
+        _ => locked.as_deref() == Some("0"),
+    })
+}
+
+fn read_avb(cfg: &DeviceConfig) -> Result<AvbStatus, String> {
+    let read = || -> Result<AvbStatus> {
+        let partitions = avb_suffixes(cfg).iter().map(|s| avb::read(Path::new(skyward_block::BY_NAME), s))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        Ok(AvbStatus { unlocked: avb_unlocked()?, partitions })
+    };
+    read().map_err(|e| format!("{e:#}"))
+}
+
+fn disable_avb(cfg: &DeviceConfig, checks: avb::Checks) -> Result<AvbStatus, String> {
+    let disable = || -> Result<AvbStatus> {
+        ensure!(avb_unlocked()?, "the bootloader is locked or its unlock state is unknown");
+        let update = skyward_vab::snapshot_state()?;
+        ensure!(update == skyward_vab::SnapshotState::None, "an update is in flight or its state is unknown ({update:?})");
+        let partitions = avb::disable(Path::new(skyward_block::BY_NAME), avb_suffixes(cfg), checks)?;
+        let _ = skyward_sys::kmsg("the selected vbmeta checks are disabled; reboot for them to take effect");
+        Ok(AvbStatus { unlocked: true, partitions })
+    };
+    disable().map_err(|e| format!("{e:#}"))
 }
 
 /// Have the bootloader start `slot` next and give what the boot control
@@ -2336,6 +2375,14 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     Effect::ReadMounts => app.set_mounts(mounts()),
                     Effect::ReadSlots => app.set_boot_slots(read_slots()),
                     Effect::SetSlot(slot) => app.slot_switched(set_slot(slot), now),
+                    Effect::ReadAvb => app.set_avb(read_avb(cfg)),
+                    Effect::DisableAvb(checks) => {
+                        let result = disable_avb(cfg, checks);
+                        if result.is_err() {
+                            app.set_avb(read_avb(cfg));
+                        }
+                        app.avb_disabled(result);
+                    }
                     // The decrypt page shows meanwhile that the work is
                     // under way, and takes nothing more until it is done.
                     Effect::OpenData => {
