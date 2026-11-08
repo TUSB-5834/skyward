@@ -69,6 +69,18 @@ enum Cmd {
         /// The monospaced typeface's licence, which goes with it.
         #[arg(long)]
         mono_license: PathBuf,
+        /// A firmware file to put where the kernel's own loader finds it
+        /// before its first driver probe: name=local-file. The loader reads
+        /// /lib/firmware before it asks anyone else, and the motor's driver
+        /// probes in early-init, before a recovery starts, so that is where
+        /// the file has to be.
+        #[arg(long = "firmware")]
+        firmware: Vec<String>,
+        /// A module to put in the recovery's module directory, as
+        /// name.ko=local-file. It must match the recovery kernel, not merely
+        /// the installed system's vendor_dlkm.
+        #[arg(long = "module")]
+        modules: Vec<String>,
         /// Required when the device config starts the Thales OMAPI bridge.
         #[arg(long)]
         omapi: Option<PathBuf>,
@@ -88,7 +100,12 @@ enum Cmd {
         /// Where to write the stock recovery image.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Another partition to take from the same package, such as odm.
+        /// It is written beside --out, named <partition>.img.
+        #[arg(long, requires = "out")]
+        partition: Option<String>,
     },
+
 }
 
 fn main() -> Result<()> {
@@ -110,7 +127,7 @@ fn main() -> Result<()> {
             img.kernel = BootImage::read(&kernel)?.kernel;
             write(&out, &img, &img.to_bytes()?)
         }
-        Cmd::Recovery { stock, update_skyward, binary, config, font, mono, mono_license, omapi, out } => {
+        Cmd::Recovery { stock, update_skyward, binary, config, font, mono, mono_license, firmware, modules, omapi, out } => {
             let size = partition_size(&stock)?;
             let mut img = BootImage::read(&stock)?;
             let mut rd = Ramdisk::decode(&img.ramdisk)?;
@@ -148,6 +165,16 @@ fn main() -> Result<()> {
             put(&mut rd, paths::FONT, 0o644, read(&font)?, update_skyward)?;
             put(&mut rd, paths::MONO, 0o644, read(&mono)?, update_skyward)?;
             put(&mut rd, paths::MONO_LICENSE, 0o644, read(&mono_license)?, update_skyward)?;
+            for file in firmware {
+                let (name, from) = file.split_once('=').with_context(|| "--firmware takes name=local-file")?;
+                ensure!(!name.is_empty() && !name.starts_with('/') && !name.contains(".."), "{name} is not a firmware name");
+                put(&mut rd, &format!("lib/firmware/{name}"), 0o644, read(&PathBuf::from(from))?, update_skyward)?;
+            }
+            for file in modules {
+                let (name, from) = file.split_once('=').with_context(|| "--module takes name.ko=local-file")?;
+                ensure!(name.ends_with(".ko") && !name.contains('/') && !name.contains(".."), "{name} is not a module name");
+                put(&mut rd, &format!("lib/modules/{name}"), 0o644, read(&PathBuf::from(from))?, update_skyward)?;
+            }
             // A stock ramdisk may run logd without any scheduling profiles,
             // and logd stops as soon as it cannot find the one it asks for.
             if rd.find(paths::TASK_PROFILES).is_none() {
@@ -171,12 +198,12 @@ fn main() -> Result<()> {
             let bytes = img.to_bytes()?;
             write(&out, &img, &avb::footed(&bytes, "recovery", size, &Sha256::digest(&bytes))?)
         }
-        Cmd::Stock { config, out } => {
+        Cmd::Stock { config, out, partition } => {
             let stock = skyward_config::DeviceConfig::load(&config)?.stock.with_context(|| format!("{} names no stock build", config.display()))?;
             println!("version={}\npackage={}\nrecovery={}", stock.version, stock.package, stock.recovery);
-            match out {
-                Some(out) => take_stock_recovery(&stock, &out),
-                None => Ok(()),
+            match (out, partition) {
+                (Some(out), partition) => take_stock_recovery(&stock, &out, partition.as_deref()),
+                (None, _) => Ok(()),
             }
         }
     }
@@ -188,13 +215,17 @@ const RECOVERY: &str = "recovery";
 /// Take the recovery partition out of the stock build's full update package
 /// on its server, reading only what that partition takes of it, and write it
 /// to `out` once its SHA-256 is the one the configuration names.
-fn take_stock_recovery(stock: &skyward_config::Stock, out: &Path) -> Result<()> {
+fn take_stock_recovery(stock: &skyward_config::Stock, out: &Path, other: Option<&str>) -> Result<()> {
+    if let Some(name) = other {
+        ensure!(!name.is_empty() && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-') && name != RECOVERY, "{name} is not a separate partition name");
+    }
     let parent = out.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent).with_context(|| format!("make {}", parent.display()))?;
     // Taken out beside where it goes, so it is moved there whole.
     let work = tempfile::Builder::new().prefix(".stock").tempdir_in(parent).with_context(|| format!("make a folder in {}", parent.display()))?;
     let payload = unpayload::Payload::open_url(&stock.package).with_context(|| format!("open {}", stock.package))?;
-    let options = unpayload::ExtractOptions { output_dir: work.path().to_path_buf(), partitions: vec![RECOVERY.into()], ..Default::default() };
+    let partitions = std::iter::once(RECOVERY.into()).chain(other.map(str::to_owned)).collect();
+    let options = unpayload::ExtractOptions { output_dir: work.path().to_path_buf(), partitions, ..Default::default() };
     let report = |event: unpayload::Event<'_>| match event {
         unpayload::Event::Started { partitions } => {
             for (name, bytes) in partitions {
@@ -209,6 +240,12 @@ fn take_stock_recovery(stock: &skyward_config::Stock, out: &Path) -> Result<()> 
     let sum: String = image.sha256.as_deref().context("the package's own sum of the image was not checked")?.iter().map(|b| format!("{b:02x}")).collect();
     ensure!(sum == stock.recovery, "the {RECOVERY} partition in {} has the SHA-256 {sum}, where the configuration names {}", stock.package, stock.recovery);
     std::fs::rename(&image.path, out).with_context(|| format!("move {} to {}", image.path.display(), out.display()))?;
+    if let Some(partition) = other {
+        let extra = taken.iter().find(|i| i.partition == partition).with_context(|| format!("{} holds no {partition} partition", stock.package))?;
+        let target = out.parent().unwrap_or(Path::new(".")).join(format!("{partition}.img"));
+        std::fs::rename(&extra.path, &target).with_context(|| format!("move {} to {}", extra.path.display(), target.display()))?;
+        println!("wrote {} ({} bytes)", target.display(), extra.size);
+    }
     println!("wrote {} ({} bytes), its SHA-256 the one the configuration names", out.display(), image.size);
     Ok(())
 }

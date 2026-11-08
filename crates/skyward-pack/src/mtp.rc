@@ -1,15 +1,48 @@
-# File transfer: an MTP function beside adb. Skyward serves the function
-# itself; once it has written the descriptors it sets sys.usb.ffs.mtp.ready,
-# and with adbd ready too, init binds the two together.
+# File transfer: an MTP function beside adb, in the port's own configuration.
+#
+# This recovery's stock init.rc offers adb and fastboot and nothing else: its
+# gadget is made with ffs.adb on b.1/f1, and its rules bind the port for
+# "adb", "sideload" and "fastboot" only. Everything MTP needs is therefore
+# here.
+#
+# What that configuration has to do, and the rule here did not, is clear the
+# places first: b.1/f1 still holds ffs.adb from the configuration the port
+# came up in, and a symlink cannot be made where one already is. So the port
+# is taken down, both places are emptied, and only then is the MTP function
+# given f1 and adbd f2. YARP's own recovery for this phone does the same two
+# removes before its links, and its file transfer works; the rule here linked
+# over a full f1 and the MTP function never reached the port, which is how
+# turning file transfer on could leave adb as it was or lose it.
+
+# The MTP function's descriptors are Skyward's to write, so its gadget
+# directory and its function filesystem are made here, as the stock rules do
+# for adb. no_disconnect keeps opening and closing the function from
+# re-enumerating the port on its own; the re-enumeration this file does need
+# it does by writing the UDC.
 on fs && property:sys.usb.configfs=1
     mkdir /config/usb_gadget/g1/functions/ffs.mtp
-    mkdir /dev/usb-ffs/mtp 0770 root root
-    mount functionfs mtp /dev/usb-ffs/mtp rmode=0770,fmode=0660,uid=0,gid=0
+    mkdir /dev/usb-ffs/mtp 0770 shell system
+    mount functionfs mtp /dev/usb-ffs/mtp uid=0,gid=0,rmode=0770,fmode=0660,no_disconnect=1
 
+# Nothing is writing the MTP function's descriptors once adbd has gone, and
+# the stock rule for "none" clears adbd's own readiness with it.
+on property:init.svc.adbd=stopped
+    setprop sys.usb.ffs.mtp.ready 0
+
+# Turning file transfer on starts adbd beside it; the stock rules have no rule
+# for "mtp,adb" that would.
 on property:sys.usb.config=mtp,adb && property:sys.usb.config_disable=0
     start adbd
 
-on property:sys.usb.config=mtp,adb && property:sys.usb.ffs.ready=1 && property:sys.usb.ffs.mtp.ready=1 && property:sys.usb.configfs=1
+# The configuration is built once both functions have been opened: Skyward's
+# MTP service sets ffs.mtp.ready as it starts, and ffs.ready is adbd's. The
+# port is taken down, the two functions are put in it, and it is bound again
+# with both — one re-enumeration, and adb comes back with file transfer beside
+# it rather than going away.
+on property:sys.usb.ffs.ready=1 && property:sys.usb.ffs.mtp.ready=1 && property:sys.usb.config=mtp,adb && property:sys.usb.configfs=1
+    write /config/usb_gadget/g1/UDC "none"
+    rm /config/usb_gadget/g1/configs/b.1/f1
+    rm /config/usb_gadget/g1/configs/b.1/f2
     write /config/usb_gadget/g1/idProduct 0x4EE2
     write /config/usb_gadget/g1/configs/b.1/strings/0x409/configuration "mtp_adb"
     symlink /config/usb_gadget/g1/functions/ffs.mtp /config/usb_gadget/g1/configs/b.1/f1
@@ -17,6 +50,7 @@ on property:sys.usb.config=mtp,adb && property:sys.usb.ffs.ready=1 && property:s
     write /config/usb_gadget/g1/UDC ${sys.usb.controller}
     setprop sys.usb.state ${sys.usb.config}
 
-# The stock rules take the first function off; this takes the second.
+# The stock rule for "none" takes the first function off; this takes the
+# second, which is adbd's while file transfer is on.
 on property:sys.usb.config=none && property:sys.usb.configfs=1
     rm /config/usb_gadget/g1/configs/b.1/f2

@@ -141,6 +141,10 @@ pub fn confirm_label(which: Confirm, s: &State) -> (&'static str, bool) {
 pub const HOME_TITLE: &str = "Skyward";
 pub const SEARCH_HINT: Text = ["搜索功能与分区", "搜尋功能與分割區", "Search features and partitions"];
 
+/// Captions under the readings on the home card's strip.
+const DATA_STATE: Text = ["数据分区", "資料分割區", "Data partition"];
+const FREE_SPACE: Text = ["可用空间", "可用空間", "Free space"];
+
 const REBOOT_TARGETS: [(Text, Option<Text>); 6] = [
     (["系统", "系統", "System"], None),
     (["恢复模式", "復原模式", "Recovery"], None),
@@ -161,6 +165,7 @@ const ABOUT: Text = ["关于本机", "關於手機", "About phone"];
 const SPECS: Text = ["全部参数与信息", "全部規格與資訊", "All specs"];
 const LOGS: Text = ["导出日志", "匯出記錄", "Export logs"];
 const SCREEN_TIMEOUT: Text = ["息屏时间", "螢幕自動關閉", "Screen timeout"];
+const ALWAYS_ON: Text = ["息屏显示", "螢幕關閉顯示", "Always-on display"];
 const UPDATE: Text = ["系统更新", "系統更新", "System update"];
 const SKYWARD_UPDATE: Text = ["Skyward 更新", "Skyward 更新", "Skyward update"];
 const FILES: Text = ["文件管理", "檔案管理", "File manager"];
@@ -204,8 +209,9 @@ fn hits(rects: &[Rect], actions: &[Action]) -> Vec<Hit> {
 }
 
 /// Recovery home, laid out like the Settings root: title, search, a device
-/// card, then grouped entries. The status bar carries the readings: the
-/// slot, the data partition's lock and the battery's temperature.
+/// card, then grouped entries. The card's strip carries the readings: the
+/// slot, the data partition's lock, the room left on it and the battery; the
+/// status bar adds the battery's temperature.
 pub fn home(cx: &Ctx) -> Frame {
     let (t, f, i, l) = (cx.t, cx.f, cx.info, cx.state.lang);
     let mut c = long_page(cx);
@@ -247,7 +253,25 @@ pub fn home(cx: &Ctx) -> Frame {
         rows.push(Row::new(title).icon(ORANGE, Icon::Power).subtitle(note).trail(Trail::Arrow));
         opens.push(Some(Action::Open(Screen::Slot)));
     }
-    let card = widgets::device_card(&mut c, t, f, y, &i.model, &sub, &rows);
+    // The strip of readings under the phone's name: the slot the recovery
+    // runs from, the data partition's lock, the room left on it and the
+    // battery's level, each as the stock settings home shows them.
+    let stats = [
+        widgets::Stat {
+            value: i.slot.map(|s| s.letter().to_string()).unwrap_or_else(|| l.pick(["未知", "不明", "Unknown"]).to_string()),
+            caption: l.pick(CURRENT_SLOT),
+        },
+        widgets::Stat { value: fmt::data(l, &cx.state.data).to_string(), caption: l.pick(DATA_STATE) },
+        widgets::Stat {
+            value: i.storage.free.map(fmt::bytes).unwrap_or_else(|| l.pick(["未知", "不明", "Unknown"]).to_string()),
+            caption: l.pick(FREE_SPACE),
+        },
+        widgets::Stat {
+            value: i.battery.as_ref().map(|b| format!("{}%", b.level)).unwrap_or_else(|| l.pick(["未知", "不明", "Unknown"]).to_string()),
+            caption: i.battery.as_ref().map(|b| fmt::charge(l, b.charge)).unwrap_or_else(|| l.pick(["无电池", "無電池", "No battery"])),
+        },
+    ];
+    let card = widgets::device_card(&mut c, t, f, y, &i.model, &sub, &stats, &rows);
     out.push(Hit { rect: card.rows[0], action: Action::Open(Screen::About) });
     out.extend(card.rows[1..].iter().zip(&opens).filter_map(|(&rect, open)| open.map(|action| Hit { rect, action })));
     y = card.bottom + t.m.card_gap;
@@ -329,7 +353,24 @@ pub fn settings(cx: &Ctx) -> Frame {
     if let Some(r) = vibration.below {
         out.push(Hit { rect: r, action: Action::Toggle(Switch::Vibrate) });
     }
-    y = widgets::section(&mut c, t, f, vibration.bottom, l.pick(["通用", "一般", "General"]));
+    // A phone whose panel has a doze of its own keeps a little on the glass
+    // with the screen off; one whose panel has none shows nothing to offer.
+    // It sits under the vibration, so the settings above it stay where the
+    // pages have always put them.
+    let mut y = vibration.bottom;
+    if s.panel_dozes {
+        y = widgets::section(&mut c, t, f, y, l.pick(["息屏显示", "螢幕關閉顯示", "Always-on display"]));
+        let on = Row::new(l.pick(ALWAYS_ON)).trail(Trail::Switch(s.always_on));
+        let aod = widgets::list(&mut c, t, f, y, &[on]);
+        out.extend(hits(&aod.rows, &[Action::Toggle(Switch::AlwaysOn)]));
+        let note = l.pick([
+            "屏幕熄灭后仍显示时间、电量、槽位与解密状态，背光保持关闭。",
+            "螢幕關閉後仍顯示時間、電量、槽位與解密狀態，背光保持關閉。",
+            "With the screen off, the time, the battery, the slot and the data partition stay on the glass, with the backlight out.",
+        ]);
+        y = widgets::footnote(&mut c, t, f, aod.bottom, note);
+    }
+    y = widgets::section(&mut c, t, f, y, l.pick(["通用", "一般", "General"]));
     let general = widgets::list(&mut c, t, f, y, &[
         Row::new(l.pick(LANGUAGE)).icon(BLUE, Icon::Globe).trail(Trail::Value(l.name())),
         Row::new(l.pick(TIME_ZONE)).icon(ORANGE, Icon::Clock).trail(Trail::Value(l.pick(TIME_ZONES[s.time_zone].0))),
@@ -658,14 +699,7 @@ pub fn decrypt(cx: &Ctx) -> Frame {
             Some(l.pick(["正在读取锁屏方式", "正在讀取螢幕鎖定方式", "Reading the screen lock"])),
             None,
         ),
-        Data::Open => data_status(
-            cx,
-            c,
-            Icon::Folder,
-            l.pick(["data 分区已解密", "data 分割區已解密", "The data partition is decrypted"]),
-            Some(l.pick(["你可以在「文件管理」中查看本机文件", "你可以在「檔案管理」中查看本機檔案", "You can see the phone's files in File manager"])),
-            None,
-        ),
+        Data::Open => open_with_others(cx, c),
         Data::Failed(why) => data_status(cx, c, Icon::Lock, l.pick(["未能打开 data 分区", "無法開啟 data 分割區", "Couldn't open the data partition"]), None, Some(why)),
         Data::Erased => data_status(
             cx,
@@ -676,6 +710,78 @@ pub fn decrypt(cx: &Ctx) -> Frame {
             None,
         ),
     }
+}
+
+/// The partitions open: the owner's files first, then, where a phone keeps
+/// further users whose own files are still closed — a second space's, a
+/// cloned app's — each offered by name, since the owner came to open the
+/// owner's files and those do not hold the recovery. Tapping one asks for
+/// that user's screen lock.
+fn open_with_others(cx: &Ctx, mut c: Canvas) -> Frame {
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    let m = &t.m;
+    let others = &s.others;
+    if others.is_empty() {
+        return data_status(
+            cx,
+            c,
+            Icon::Folder,
+            l.pick(["data 分区已解密", "data 分割區已解密", "The data partition is decrypted"]),
+            Some(l.pick(["你可以在「文件管理」中查看本机文件", "你可以在「檔案管理」中查看本機檔案", "You can see the phone's files in File manager"])),
+            None,
+        );
+    }
+    let x = m.w as f32 / 2.0;
+    let sign_cy = m.dp(150.0);
+    c.fill_circle(x, sign_cy, m.dp(30.0), t.pal.card);
+    icons::glyph(&mut c, Icon::Folder, x, sign_cy, m.dp(40.0), t.pal.accent);
+    c.text_center(&f.heading, l.pick(["data 分区已解密", "data 分割區已解密", "The data partition is decrypted"]), x, sign_cy + m.dp(64.0), m.dp(24.0), t.pal.text);
+    c.text_center(
+        &f.body,
+        l.pick(["你可以在「文件管理」中查看本机文件", "你可以在「檔案管理」中查看本機檔案", "You can see the phone's files in File manager"]),
+        x,
+        sign_cy + m.dp(98.0),
+        m.sub_px,
+        t.pal.subtitle,
+    );
+    // The users still closed, each a row that asks for that user's lock.
+    let note = l.pick([
+        "以下用户的文件尚未解锁，其他用户的数据不受影响：",
+        "以下使用者的檔案尚未解鎖，其他使用者的資料不受影響：",
+        "These users' files are still closed; the other users' are not affected:",
+    ]);
+    // The rows borrow their names, so the names are made first and outlive
+    // them.
+    let names: Vec<String> = others
+        .iter()
+        .map(|(user, _)| match *user {
+            0 => l.pick(["本机用户", "本機使用者", "This phone's user"]).to_string(),
+            user => tr!(l, "用户 {user}", "使用者 {user}", "User {user}"),
+        })
+        .collect();
+    let controls: Vec<&'static str> = others
+        .iter()
+        .map(|(_, keys)| {
+            l.pick(match *keys {
+                Keys::Pattern => ["图案", "圖案", "Pattern"],
+                Keys::Digits => ["密码", "密碼", "PIN"],
+                Keys::Letters => ["密码", "密碼", "Password"],
+            })
+        })
+        .collect();
+    let rows: Vec<Row> = names
+        .iter()
+        .zip(&controls)
+        .map(|(name, control)| Row::new(name).icon(SLATE, Icon::Lock).trail(Trail::Value(control)))
+        .collect();
+    let top = sign_cy + m.dp(140.0);
+    let y = widgets::footnote(&mut c, t, f, top, note);
+    let list = widgets::list(&mut c, t, f, y, &rows);
+    let mut out: Vec<Hit> = list.rows.iter().zip(others).map(|(&rect, (user, _))| Hit { rect, action: Action::UnlockUser(*user) }).collect();
+    let leave_cy = m.h as f32 - m.dp(64.0);
+    c.text_center(&f.heading, l.pick(["完成", "完成", "Done"]), x, leave_cy, m.row_title_px, t.pal.accent);
+    out.push(Hit { rect: Rect::new(x - m.dp(80.0), leave_cy - m.dp(24.0), m.dp(160.0), m.dp(48.0)), action: Action::Skip });
+    Frame { header: false, ..Frame::new(t, c, out, l.pick(DECRYPT), 0.0) }
 }
 
 /// Where the partition stands, under its sign: a line on it, or why it

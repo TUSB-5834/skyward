@@ -30,6 +30,12 @@ const VENDOR_INTERFACE: &str = "ro.vndk.version";
 const DESCRIPTIONS: [&str; 2] = ["/vendor/etc/vintf/manifest", "/odm/etc/vintf/manifest"];
 const RECOVERY_DESCRIPTIONS: &str = "/system/etc/vintf/manifest";
 
+/// Where the phone keeps the descriptions that are not split into the folder
+/// above: one file per build of the platform's hardware stack, named after
+/// the platform, as sun and tuna are. The phone carries every platform's, and
+/// only the running one's describes hardware that is here.
+const PLATFORM_DESCRIPTIONS: [&str; 2] = ["/vendor/etc/vintf", "/odm/etc/vintf"];
+
 /// The name init knows the service directory by, and the program it runs.
 const DIRECTORY_SERVICE: &str = "servicemanager";
 const DIRECTORY_PROGRAM: &str = "/system/bin/servicemanager";
@@ -154,6 +160,49 @@ fn describe_hardware(wanted: &[String]) -> Result<String> {
     Ok(out)
 }
 
+/// The libraries the phone's own hardware services need from the installed
+/// system, which a recovery's own /system/lib64 leaves out.
+///
+/// The phone's HALs are built against the system's bionic: libhardware.so in
+/// the vendor partition asks for libvndksupport.so, which asks for
+/// libdl_android.so, and both live on the system partition, not in the
+/// recovery's ramdisk. The system's own init mounts /system before any of
+/// them starts, and a recovery does not. Without them every one of the
+/// phone's hardware services ends as soon as it starts, keymint's among
+/// them, and the data partition stays closed for want of it.
+const SYSTEM_LIBRARIES: [&str; 2] = ["libvndksupport.so", "libdl_android.so"];
+
+/// Where the recovery's own programs load their libraries from.
+const RECOVERY_LIBRARY_DIR: &str = "/system/lib64";
+
+/// Copy the libraries `SYSTEM_LIBRARIES` names from the installed system
+/// into the folder the recovery's own programs load from, so the phone's
+/// hardware services can be loaded at all.
+pub fn provide_system_libraries() -> Result<usize> {
+    let into = Path::new(RECOVERY_LIBRARY_DIR);
+    // The system is mounted at /mnt/system; its libraries are where its own
+    // linker looks, and the bionic ones sit beside its bootstrap copy.
+    let dirs = [Path::new("/mnt/system/system/lib64"), Path::new("/mnt/system/system/lib64/bootstrap")];
+    let mut copied = 0;
+    for name in SYSTEM_LIBRARIES {
+        let to = into.join(name);
+        if to.exists() {
+            // A library an earlier run of the recovery put there is as good
+            // as the one on the system, which does not change under it.
+            continue;
+        }
+        let Some(from) = dirs.iter().map(|d| d.join(name)).find(|p| p.is_file()) else { continue };
+        // Copied beside where it goes and renamed into place, so a program
+        // starting at the same moment never reads half a library.
+        let mut part = to.clone().into_os_string();
+        part.push(".part");
+        fs::copy(&from, &part).with_context(|| format!("copy {} to {}", from.display(), Path::new(&part).display()))?;
+        fs::rename(&part, &to).with_context(|| format!("put {} in place", to.display()))?;
+        copied += 1;
+    }
+    Ok(copied)
+}
+
 /// Open the bundle of libraries the phone's own partitions were built
 /// against and give the directory they are in. A phone whose partitions
 /// need no bundle has none to open.
@@ -236,9 +285,32 @@ pub fn publish_descriptions(wanted: &[String], files: &[String]) -> Result<usize
             }
         }
     }
+    // The platform's own descriptions, which are not in the folder above: one
+    // file per build of the hardware stack, named after the platform. Only the
+    // running platform's describes hardware that is here, so only it is read.
+    if let Some(platform) = skyward_sys::prop("ro.board.platform") {
+        for dir in PLATFORM_DESCRIPTIONS {
+            let from = Path::new(dir).join(format!("manifest_{platform}.xml"));
+            let Ok(text) = fs::read_to_string(&from) else { continue };
+            if wanted.iter().any(|w| describes(&text, w)) {
+                take(&from, &text)?;
+            }
+        }
+    }
     for file in files {
         let from = Path::new(file);
-        take(from, &fs::read_to_string(from).with_context(|| format!("read {file}"))?)?;
+        // The configuration names a description for each service it lists,
+        // and a phone's build need not carry every one of them: a missing
+        // file is left out rather than failing the whole set, which would
+        // leave even the services whose descriptions are there unknown to
+        // the directory.
+        match fs::read_to_string(from) {
+            Ok(text) => take(from, &text)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("no description at {file}; the service it belongs to goes without")
+            }
+            Err(e) => return Err(e).with_context(|| format!("read {file}")),
+        }
     }
     let rewritten = say_framework(into)?;
     if copied > 0 || rewritten > 0 {
@@ -308,8 +380,37 @@ fn register_again(registered: &[(String, String)]) -> Result<()> {
 /// into the place both readers take as the framework's, and the newer of
 /// the two readers drops the whole set over one description that says it
 /// is the phone's.
+///
+/// Its version is brought down to the oldest one for the same reason. The
+/// reader is the one the recovery was built with, and it drops the whole
+/// set over a version it does not know: a description written for a build
+/// of the platform newer than the recovery says so, and then nothing
+/// registers at all.
 fn as_framework(text: &str) -> String {
-    text.replace("type=\"device\"", "type=\"framework\"").replace("type='device'", "type='framework'")
+    let text = text.replace("type=\"device\"", "type=\"framework\"").replace("type='device'", "type='framework'");
+    oldest_version(&text)
+}
+
+/// The oldest version a description can name, which every reader knows.
+const OLDEST_VERSION: &str = "1.0";
+
+/// The text with the version on its `<manifest …>` line made
+/// [`OLDEST_VERSION`], or as it is when it names that version already or
+/// names none.
+fn oldest_version(text: &str) -> String {
+    const SAID: &str = "version=";
+    let Some(start) = text.find("<manifest") else { return text.to_string() };
+    let Some(element) = text[start..].split_once('>').map(|(element, _)| element) else { return text.to_string() };
+    let Some(at) = element.find(SAID) else { return text.to_string() };
+    let rest = &element[at + SAID.len()..];
+    let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else { return text.to_string() };
+    let Some(end) = rest[1..].find(quote).map(|e| e + 1) else { return text.to_string() };
+    if rest[1..end] == *OLDEST_VERSION {
+        return text.to_string();
+    }
+    let from = start + at;
+    let to = start + at + SAID.len() + end + 1;
+    format!("{}version={quote}{OLDEST_VERSION}{quote}{}", &text[..from], &text[to..])
 }
 
 /// Say the same of the descriptions already there, which a recovery ships
@@ -356,5 +457,55 @@ fn answering_again(was: Option<u32>) -> Result<()> {
             anyhow::bail!("the service directory did not come back");
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::as_framework;
+
+    #[test]
+    fn a_description_of_the_phones_own_hardware_is_taken_as_the_frameworks() {
+        assert_eq!(
+            as_framework("<manifest version=\"8.0\" type=\"device\">\n"),
+            "<manifest version=\"1.0\" type=\"framework\">\n"
+        );
+        assert_eq!(
+            as_framework("<manifest version='8.0' type='device'>"),
+            "<manifest version='1.0' type='framework'>"
+        );
+    }
+
+    #[test]
+    fn a_description_written_for_a_newer_platform_is_read_as_the_oldest_version() {
+        // This is the one that stopped the boot: the description the
+        // recovery carries for se_omapi says it was written for a version
+        // the recovery's own reader does not know, and the reader then drops
+        // every description there is, so no service registers at all.
+        assert_eq!(
+            as_framework("<manifest version=\"9.0\" type=\"framework\">\n"),
+            "<manifest version=\"1.0\" type=\"framework\">\n"
+        );
+        assert_eq!(
+            as_framework("<manifest version='9.0' type='framework'>"),
+            "<manifest version='1.0' type='framework'>"
+        );
+    }
+
+    #[test]
+    fn a_description_that_already_names_the_oldest_version_is_left_as_it_is() {
+        for text in [
+            "<manifest version=\"1.0\" type=\"framework\"><hal/></manifest>\n",
+            "<manifest type=\"framework\"><hal/></manifest>\n",
+        ] {
+            assert!(as_framework(text) == text, "{text}");
+        }
+    }
+
+    #[test]
+    fn only_the_version_of_the_description_itself_is_brought_down() {
+        let said = "<!-- version=\"9.0\" -->\n<manifest version=\"7.0\" type=\"framework\">\n    <hal version=\"4.0\"/>\n</manifest>\n";
+        let want = "<!-- version=\"9.0\" -->\n<manifest version=\"1.0\" type=\"framework\">\n    <hal version=\"4.0\"/>\n</manifest>\n";
+        assert_eq!(as_framework(said), want);
     }
 }

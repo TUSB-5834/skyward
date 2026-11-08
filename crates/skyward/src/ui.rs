@@ -1,3 +1,4 @@
+use crate::aod;
 use crate::backup;
 use crate::decrypt::{self, Decryptor};
 use crate::filework;
@@ -29,9 +30,10 @@ use skyward_block::usb::{self, Drive};
 use skyward_net::download::{self, Failure};
 use skyward_net::http::Servers;
 use skyward_net::release::{Installed, Release, Unanswered};
-use skyward_net::wlan::{Power as WlanPower, Stage as Joining, Wlan};
+use skyward_net::wlan::{Power as WlanPower, Stage as Joining};
 use skyward_sys::sleep::{Sleeper, Slept};
 use skyward_sys::uevent;
+use skyward_ui::aod::{Shown, Want};
 use skyward_ui::app::{
     App, Asked, BackupAt, BackupEnd, BackupEntry, BackupRefusal, ClashChoice, Data, DownloadEnd, Effect, EraseStop, FileKind, FileOp,
     FileRow, FileTask, FsAction, FsRow, Have, Held, ItemEnd, ItemState, JobEnd, Keys, MountFailure, Part, PartKind, PartStop, Place,
@@ -108,7 +110,21 @@ impl Backlight {
                 .parse()
                 .with_context(|| format!("parse {name}"))
         };
-        let top = normal_max(read("max_brightness")?)?;
+        let max = read("max_brightness")?;
+        // The panel's normal maximum is read from the node the display
+        // driver booted with, which not every panel gives the same way. A
+        // panel whose node says it as none of them still shows the pages,
+        // at the whole of the backlight's range, and the reason goes to the
+        // kernel log rather than ending the recovery.
+        let top = match normal_max(max) {
+            Ok(top) => top,
+            Err(e) => {
+                let _ = skyward_sys::kmsg(&format!(
+                    "the panel's normal maximum brightness is not known, so the backlight's own maximum is used: {e:#}"
+                ));
+                max
+            }
+        };
         let level = read("brightness")?;
         Ok(Backlight { path: dir.join("brightness"), top, level })
     }
@@ -292,11 +308,46 @@ fn asked(request: &bcb::Request) -> Asked {
     }
 }
 
-/// Read a folder for the file manager, as it is now.
-fn list(app: &mut App, folder: String) -> Result<()> {
-    let files = read_folder(Path::new(&folder)).map_err(|e| format!("{e:#}"));
+/// Read a folder for the file manager, as it is now. A folder of a user
+/// whose own files are still closed says so in place of its entries: the
+/// names in it cannot be read until that user's credential is given.
+fn list(app: &mut App, folder: String, closed: &[Closed]) -> Result<()> {
+    let files = match closed_to_user(closed, Path::new(&folder)) {
+        Some((_, why)) => Err(why),
+        None => read_folder(Path::new(&folder)).map_err(|e| format!("{e:#}")),
+    };
     app.set_files(folder, files, unix_now()?);
     Ok(())
+}
+
+/// The number of the user a folder of the data partition belongs to, where
+/// it is one of the phone's own user areas: `/data/user/<n>`, where each
+/// user's own files live, and `/data/media/<n>`, where a user's shared
+/// storage does. `None` for every other folder.
+fn user_of(path: &Path) -> Option<u32> {
+    skyward_crypto::users::user_of(path)
+}
+
+/// What to say of a folder that cannot be listed because the own files of
+/// `user` are still closed, or `None` when that is not why.
+///
+/// A phone that keeps a second space or a cloned app open has users whose
+/// own files stay closed until their credential is given: the recovery
+/// opens the owner's and leaves the rest for the file manager to offer. A
+/// folder of theirs, opened before that, reads as names it cannot show, so
+/// the page says which user's files are still closed rather than that the
+/// folder is empty or broken.
+fn closed_to_user(closed: &[Closed], path: &Path) -> Option<(u32, String)> {
+    let user = user_of(path)?;
+    let entry = closed.iter().find(|c| c.user == user)?;
+    let why = match &entry.why {
+        Some(why) => format!("user {user}'s own files did not open: {why}"),
+        None => format!(
+            "user {user}'s own files are still closed. The recovery opens the owner's first; \
+             return to the decrypt page and enter this user's screen lock to open them."
+        ),
+    };
+    Some((user, why))
 }
 
 /// Read a folder of `place` to choose a file to install in, as it is now;
@@ -827,11 +878,17 @@ fn log_mounted(mounted: &Opened) -> Result<()> {
     skyward_sys::kmsg(&format!("{} holds {} at {}", mounted.mapped.display(), mounted.filesystem, skyward_crypto::data::MOUNT))
 }
 
-/// Show what the data partition still keeps closed: the first user whose
-/// own files wait on a screen lock they set themselves, with the control
-/// that lock is answered with, or nothing. Users whose credential the phone
-/// made up open behind the owner and are never asked; one that did not
-/// open goes to the kernel log with why.
+/// Show what the data partition still keeps closed: the owner's screen lock,
+/// where the owner's own files wait on one, with the control it is answered
+/// with, or nothing. Users whose credential the phone made up open behind
+/// the owner and are never asked; one that did not open goes to the kernel
+/// log with why.
+///
+/// A further user's own files — a second space's, a cloned app's — are left
+/// closed without being asked about: the owner came to open the owner's
+/// files, and holding the recovery at such a user's prompt while the
+/// owner's files are open behind it helps nobody. The file manager offers to
+/// open one when a folder of theirs is opened instead.
 fn show_closed(app: &mut App, closed: &[Closed]) -> Result<()> {
     use skyward_crypto::user::Lock;
     skyward_sys::kmsg(&format!("the users whose own files are still closed: {:?}", closed.iter().map(|c| c.user).collect::<Vec<_>>()))?;
@@ -840,16 +897,41 @@ fn show_closed(app: &mut App, closed: &[Closed]) -> Result<()> {
             skyward_sys::kmsg(&format!("the files of user {} stay closed: {why}", c.user))?;
         }
     }
-    let waiting = closed.iter().find(|c| !c.made_up).map(|c| {
-        let keys = match c.lock {
-            Lock::PATTERN => Keys::Pattern,
-            Lock::PIN => Keys::Digits,
-            _ => Keys::Letters,
-        };
-        (c.user, keys)
+    let asking = skyward_crypto::users::ask(&waiting_of(closed));
+    let waiting = asking.and_then(|user| {
+        closed.iter().find(|c| c.user == user).map(|c| {
+            let keys = match c.lock {
+                Lock::PATTERN => Keys::Pattern,
+                Lock::PIN => Keys::Digits,
+                _ => Keys::Letters,
+            };
+            (c.user, keys)
+        })
     });
-    app.data_waiting(waiting);
+    // Those the page offers by name rather than asks for: every user still
+    // closed that the phone did not make a credential up for, but not the
+    // one being asked for.
+    let others = closed
+        .iter()
+        .filter(|c| !c.made_up && Some(c.user) != asking)
+        .map(|c| {
+            let keys = match c.lock {
+                Lock::PATTERN => Keys::Pattern,
+                Lock::PIN => Keys::Digits,
+                _ => Keys::Letters,
+            };
+            (c.user, keys)
+        })
+        .collect();
+    app.data_waiting(waiting, others);
+    app.state.closed_users = !closed.is_empty();
     Ok(())
+}
+
+/// The users `closed` names, as much of each as the choice between them
+/// needs.
+fn waiting_of(closed: &[Closed]) -> Vec<skyward_crypto::users::Waiting> {
+    closed.iter().map(|c| skyward_crypto::users::Waiting { user: c.user, made_up: c.made_up }).collect()
 }
 
 /// What the file manager lists for a folder: its entries, folders and
@@ -1055,15 +1137,33 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         None => None,
     };
     let mut surface = KmsSurface::open_with_spr("/dev/dri/card0", spr.as_ref())?;
+    // What the display was told is worth having in the kernel log even when
+    // the pages come up: it says which subpixel block, if any, went out.
+    let _ = skyward_sys::kmsg(&format!("the display is {}", surface.describe()));
     let (w, h) = surface.size();
-    eprintln!("display {}", surface.describe());
     let mut inputs = Inputs::open(w, h, cfg.touch.writes.clone())?;
     let started = Instant::now();
     let mut touch_known = false;
     // adbd and fastbootd ask over it to go over to fastboot and back.
     let control = Control::open()?;
-    let mut haptics = cfg.haptics.as_ref().map(Haptics::open).transpose()?;
-    let mut backlight = Backlight::open()?;
+    // Neither the motor nor the backlight is what shows the pages: a phone
+    // whose motor driver is not loaded, or whose panel backlight is not
+    // reached where the phone's own driver keeps it, still works, and why
+    // one is not used goes to the kernel log.
+    let mut haptics = match cfg.haptics.as_ref().map(Haptics::open).transpose() {
+        Ok(haptics) => haptics,
+        Err(e) => {
+            let _ = skyward_sys::kmsg(&format!("the motor is not used: {e:#}"));
+            None
+        }
+    };
+    let mut backlight = match Backlight::open() {
+        Ok(backlight) => Some(backlight),
+        Err(e) => {
+            let _ = skyward_sys::kmsg(&format!("the panel's backlight is not reached: {e:#}"));
+            None
+        }
+    };
     let first = match &request.work {
         Work::Fastboot => Screen::Fastboot,
         Work::PromptWipeData => Screen::CantStart,
@@ -1125,6 +1225,13 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     // Whether the panel's frame memory has been blacked out for an off
     // panel; cleared once a real frame is shown again.
     let mut blanked = false;
+    // The panel's own doze, on a phone that names one: a dark panel then
+    // keeps the time on the glass with the backlight at 0.
+    let mut doze = cfg.aod.as_ref().map(aod::Panel::new);
+    let mut faced = String::new();
+    // Whether the settings page offers a switch for the panel's own doze: a
+    // phone whose panel has one.
+    app.state.panel_dozes = cfg.aod.is_some();
     // When the panel gone dark began to rest.
     let mut rested_at: Option<Instant> = None;
     // Started for fastboot, the port goes to the phone's own fastbootd. The
@@ -1278,18 +1385,39 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     }
     // The DNS servers the network joined gave, for looking names up.
     let servers: Servers = Arc::new(Mutex::new(Vec::new()));
-    // The WLAN, on a phone whose driver the recovery brings up; it starts
-    // off. Without the bundle of the vendor interface's libraries the
-    // supplicant does not start, and the WLAN page says why.
+    // The WLAN, on a phone whose driver the recovery brings up. It comes up
+    // with the recovery rather than waiting for the switch on its page, as
+    // the phone's own system brings its WLAN up at boot: the page then shows
+    // the radio coming up instead of a switch that is off. None of this is
+    // what shows the pages, so a phone whose WLAN cannot be brought up still
+    // works, and why it could not goes to the kernel log — as a radio that
+    // fails once tried says why on its own page.
     let wlan = match &cfg.wlan {
         Some(w) => {
-            app.state.wlan = Some(Wlan::default());
-            let modules = cfg.modules.sources.iter().map(|s| skyward_modules::source_dir(s)).collect::<Result<Vec<_>>>()?;
-            let libraries = secure::libraries().unwrap_or_else(|e| {
-                let _ = skyward_sys::kmsg(&format!("the vendor interface's libraries are not open: {e:#}"));
-                None
-            });
-            Some(wlan::Worker::start(w.clone(), modules, libraries, servers.clone())?)
+            let started = (|| -> Result<wlan::Worker> {
+                let modules = cfg.modules.sources.iter().map(|s| skyward_modules::source_dir(s)).collect::<Result<Vec<_>>>()?;
+                // Without the bundle of the vendor interface's libraries the
+                // supplicant does not start, and the WLAN page says why.
+                let libraries = secure::libraries().unwrap_or_else(|e| {
+                    let _ = skyward_sys::kmsg(&format!("the vendor interface's libraries are not open: {e:#}"));
+                    None
+                });
+                wlan::Worker::start(w.clone(), modules, libraries, servers.clone())
+            })();
+            match started {
+                Ok(worker) => {
+                    app.start_wlan();
+                    worker.send(wlan::Command::On);
+                    Some(worker)
+                }
+                // With no thread to tell how the radio stands, the page is
+                // not offered at all, as on a phone the recovery brings no
+                // WLAN up for.
+                Err(e) => {
+                    let _ = skyward_sys::kmsg(&format!("the WLAN is not brought up: {e:#}"));
+                    None
+                }
+            }
         }
         None => None,
     };
@@ -1380,7 +1508,14 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         }
         let panel = app.panel(now);
         let mut shown = false;
+        let dozes = doze.as_ref().is_some_and(aod::Panel::usable);
         if panel.is_some() {
+            // Out of the panel's doze before the page goes over the face.
+            if blanked {
+                if let Some(p) = doze.as_mut() {
+                    p.want(Want::Lit);
+                }
+            }
             // A display turned off comes on again with a frame drawn for it.
             if app.take_dirty() || !surface.is_on() {
                 let t0 = Instant::now();
@@ -1393,6 +1528,30 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                 shown = true;
             }
             blanked = false;
+        } else if dozes && app.state.always_on {
+            // The face goes on the glass before the panel dozes, and again
+            // each minute: an OLED in its doze shows what the frame holds.
+            if !blanked {
+                faced.clear();
+            }
+            if !blanked || faced != shown_clock {
+                let facts = skyward_ui::aod::Facts {
+                    date: skyward_ui::fmt::date(app.state.lang, unix_now()?, app.state.time_zone),
+                    battery: info.battery.as_ref().map(|b| (b.level, b.plugged)),
+                    slot: info.slot.map(|s| s.letter().to_string()),
+                    data: skyward_ui::fmt::data(app.state.lang, &app.state.data).to_string(),
+                };
+                skyward_ui::aod::face(&mut screen, &fonts, &shown_clock, &facts, cfg.display.density as f32 / 160.0);
+                surface.present(&screen)?;
+                surface.settle()?;
+                faced.clone_from(&shown_clock);
+            }
+            if !blanked && doze.as_mut().is_some_and(|p| p.want(Want::Dark) == Shown::Blank) {
+                screen.data.fill(0);
+                surface.present(&screen)?;
+                surface.settle()?;
+            }
+            blanked = true;
         } else if !blanked {
             // Black out the panel's frame memory before the backlight goes
             // to 0 and the display off, so an OLED that floors the backlight
@@ -1405,11 +1564,26 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         // After the frame is on the panel, so a panel coming back on lights
         // with what it should show now, never with what it showed when it
         // went off.
-        if backlight.level == 0 && panel.is_some() {
+        if backlight.as_ref().is_some_and(|b| b.level == 0) && panel.is_some() {
             surface.settle()?;
         }
-        backlight.show(panel)?;
-        if panel.is_some() {
+        // Whether the panel keeps the face in its own doze: what the panel
+        // holds then is the face, so it must not be rested or turned off
+        // under it.
+        let dozing = panel.is_none() && doze.as_ref().is_some_and(aod::Panel::is_dozing);
+        // The pages are what this loop is for; a panel whose backlight
+        // cannot be written still shows them, and why it could not goes to
+        // the kernel log once rather than ending the recovery.
+        let lit = match backlight.as_mut() {
+            Some(b) => b.show(panel).map_err(|e| format!("{e:#}")),
+            None => Ok(()),
+        };
+        if let Err(e) = lit {
+            let _ = skyward_sys::kmsg(&format!("the panel's backlight is not set: {e}"));
+            backlight = None;
+        } else if dozing {
+            // The panel keeps the face in its doze; there is nothing to rest.
+        } else if panel.is_some() {
             // Lit, a panel that came on again switches to its fastest
             // refresh.
             surface.speed_up()?;
@@ -1747,7 +1921,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         if worked {
             worker = None;
             let folder = app.state.files.path.clone();
-            list(&mut app, folder)?;
+            list(&mut app, folder, &closed)?;
         }
         let mut backed = false;
         if let Some(b) = &backuper {
@@ -1939,7 +2113,14 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     show_closed(&mut app, &closed)?;
                 }
                 decrypt::Ended::Unlocked(Err(why)) => {
-                    skyward_sys::kmsg(&format!("what was entered did not open the user's files: {why}"))?;
+                    // Which user the credential was for, so that a page
+                    // holding the recovery at a second space's prompt is not
+                    // read as the owner's own credential being wrong.
+                    let who = match app.state.data {
+                        Data::Locked { user, .. } => format!("the files of user {user}"),
+                        _ => "the user's own files".to_string(),
+                    };
+                    skyward_sys::kmsg(&format!("what was entered did not open {who}: {why}"))?;
                     app.unlock_failed(why, now);
                 }
             }
@@ -2166,7 +2347,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         let job = decrypt::Job::Unlock { closed: closed.clone(), user, credential: code.into_bytes() };
                         decryptor = Some(Decryptor::start(job)?);
                     }
-                    Effect::ReadDir(folder) => list(&mut app, folder)?,
+                    Effect::ReadDir(folder) => list(&mut app, folder, &closed)?,
                     Effect::ReadPlace(place, folder) => list_place(&mut app, place, folder)?,
                     // A name taken where an entry goes is the user's to
                     // decide on before anything is written.
@@ -2407,7 +2588,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         Ok(()) => {
                             app.text_saved(Ok(()), now);
                             let folder = app.state.files.path.clone();
-                            list(&mut app, folder)?;
+                            list(&mut app, folder, &closed)?;
                         }
                         Err(e) => app.text_saved(Err(format!("{e:#}")), now),
                     },
@@ -2415,7 +2596,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         Ok(_) => {
                             app.renamed(Ok(()), now);
                             let folder = app.state.files.path.clone();
-                            list(&mut app, folder)?;
+                            list(&mut app, folder, &closed)?;
                         }
                         Err(e) if e.is::<skyward_files::Taken>() => app.renamed(Err(RenameRefused::Taken), now),
                         Err(e) => app.renamed(Err(RenameRefused::Failed(format!("{e:#}"))), now),

@@ -1669,12 +1669,14 @@ pub fn list_toned(c: &mut Canvas, t: &Theme, f: &Fonts, top: f32, rows: &[Row], 
     Block { bottom: top + h, rows: rects }
 }
 
-/// Account-style card: avatar, name and detail, then optional rows. The
-/// first rect returned covers the name row.
-pub fn device_card(c: &mut Canvas, t: &Theme, f: &Fonts, top: f32, title: &str, sub: &str, rows: &[Row]) -> Block {
+/// Account-style card: avatar, name and detail, a strip of readings, then
+/// optional rows. The first rect returned covers the name row.
+#[allow(clippy::too_many_arguments)]
+pub fn device_card(c: &mut Canvas, t: &Theme, f: &Fonts, top: f32, title: &str, sub: &str, stats: &[Stat], rows: &[Row]) -> Block {
     let m = &t.m;
     let lays: Vec<Layout> = rows.iter().map(|r| layout(c, t, f, r)).collect();
-    let h = m.account_row_h + lays.iter().map(|l| l.h).sum::<f32>();
+    let strip = if stats.is_empty() { 0.0 } else { m.dp(STAT_TOP) + stat_height(t, f) };
+    let h = m.account_row_h + strip + lays.iter().map(|l| l.h).sum::<f32>();
     let (card_x, right) = (m.margin, m.w as f32 - m.margin);
     c.fill_round_rect(card_x, top, right - card_x, h, m.card_radius, t.pal.card);
 
@@ -1696,12 +1698,56 @@ pub fn device_card(c: &mut Canvas, t: &Theme, f: &Fonts, top: f32, title: &str, 
     let tone = Tone::page(t);
     let mut rects = vec![Rect::new(card_x, top, right - card_x, m.account_row_h)];
     let mut y = top + m.account_row_h;
+    if !stats.is_empty() {
+        y = stat_strip(c, t, f, y + m.dp(STAT_TOP), stats);
+    }
     for (r, l) in rows.iter().zip(&lays) {
         draw_row(c, t, f, r, l, y, &tone);
         rects.push(Rect::new(card_x, y, right - card_x, l.h));
         y += l.h;
     }
     Block { bottom: top + h, rows: rects }
+}
+
+/// One reading of the device card's strip: a value in the row's type over
+/// its caption, both left-aligned in the strip's column.
+pub struct Stat<'a> {
+    pub value: String,
+    pub caption: &'a str,
+}
+
+/// The room the strip asks for over its values, under them and above the
+/// rows that follow.
+const STAT_TOP: f32 = 16.0;
+const STAT_BOTTOM: f32 = 24.0;
+
+/// How tall the strip's two lines are, without the room around them.
+fn stat_height(t: &Theme, f: &Fonts) -> f32 {
+    let (vt, vb) = f.heading.ink(t.m.row_title_px);
+    let (ct, cb) = f.body.ink(t.m.label_px);
+    (vb - vt) + t.m.sub_gap + (cb - ct) + t.m.dp(STAT_BOTTOM)
+}
+
+/// The device card's strip of readings under its name row: one column per
+/// reading, the first at the card's inner edge and the rest spread evenly
+/// over the room left of the last one's value.
+fn stat_strip(c: &mut Canvas, t: &Theme, f: &Fonts, top: f32, items: &[Stat]) -> f32 {
+    let m = &t.m;
+    let (card_x, right) = (m.margin, m.w as f32 - m.margin);
+    let x = card_x + m.inner;
+    let (vt, vb) = f.heading.ink(m.row_title_px);
+    let caption_top = top + (vb - vt) + m.sub_gap;
+    let bottom = top + stat_height(t, f);
+    // The last column ends at the card's inner edge; the ones before it start
+    // where the room left of that one's value spreads them.
+    let last_w = c.text_width(&f.heading, &items[items.len() - 1].value, m.row_title_px);
+    let pitch = if items.len() > 1 { (right - m.inner - last_w - x) / (items.len() - 1) as f32 } else { 0.0 };
+    for (k, s) in items.iter().enumerate() {
+        let cx = x + pitch * k as f32;
+        c.text_top(&f.heading, &s.value, cx, top, m.row_title_px, t.pal.text, None);
+        c.text_top(&f.body, s.caption, cx, caption_top, m.label_px, t.pal.spec_label, None);
+    }
+    bottom
 }
 
 pub fn switch(c: &mut Canvas, t: &Theme, right: f32, cy: f32, on: bool) {

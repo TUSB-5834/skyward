@@ -6,6 +6,8 @@ use skyward_vab::SnapshotState;
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "android")]
+mod aod;
+#[cfg(target_os = "android")]
 mod backup;
 #[cfg(target_os = "android")]
 mod decrypt;
@@ -511,6 +513,14 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
     for path in load_modules(cfg, &cfg.modules.load)? {
         skyward_sys::kmsg(&format!("loaded {}", path.display()))?;
     }
+    // The motor driver is loaded by init before the recovery can mount its
+    // partitions. Put its firmware where the firmware loader looks before
+    // that first probe, and unbind it again if that probe already failed.
+    if let Some(haptics) = &cfg.haptics {
+        if let Err(e) = haptics::bring_up(haptics, &cfg.modules.sources) {
+            skyward_sys::kmsg(&format!("the motor's driver is not brought up: {e:#}"))?;
+        }
+    }
     if !cfg.owners.is_empty() {
         let handed = hand_over(&cfg.owners)?;
         skyward_sys::kmsg(&format!("{handed} of the phone's own files handed to the accounts its init gives them"))?;
@@ -529,12 +539,28 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
     registering.extend(cfg.wlan.iter().map(|w| w.service.clone()));
     let files: Vec<String> = services.iter().filter_map(|s| s.description.clone()).collect();
     if !registering.is_empty() || !files.is_empty() {
-        let described = secure::publish_descriptions(&registering, &files)?;
-        skyward_sys::kmsg(&format!("{described} of the phone's own service descriptions published"))?;
+        // A description the phone's build does not carry, as a service the
+        // configuration lists for another build of it, leaves the directory
+        // as it is; the programs the directory is for still start, and only
+        // the service whose description is missing goes without. Ending here
+        // would take the key service and the boot control with it, and with
+        // them the data partition and the slots.
+        match secure::publish_descriptions(&registering, &files) {
+            Ok(described) => skyward_sys::kmsg(&format!("{described} of the phone's own service descriptions published"))?,
+            Err(e) => skyward_sys::kmsg(&format!("the phone's own service descriptions are not published: {e:#}"))?,
+        }
     }
     let libraries = secure::libraries()?;
     if let Some(dir) = &libraries {
         skyward_sys::kmsg(&format!("the phone's own libraries are at {}", dir.display()))?;
+    }
+    // The phone's hardware services are built against the installed system's
+    // bionic, which a recovery's own library folder leaves out. Without the
+    // two it is missing, every one of them ends as soon as it starts.
+    match secure::provide_system_libraries() {
+        Ok(0) => {}
+        Ok(copied) => skyward_sys::kmsg(&format!("{copied} libraries of the installed system are in place for its services"))?,
+        Err(e) => skyward_sys::kmsg(&format!("the installed system's libraries are not in place: {e:#}"))?,
     }
     services::start(&services, libraries.as_deref())?;
     agree_on_the_notes_key(&registering)

@@ -49,6 +49,9 @@ pub struct Settings {
     pub vibration: f32,
     /// A computer connected over USB is offered internal storage.
     pub file_transfer: bool,
+    /// A dark panel keeps the clock and the phone's readings on the glass in
+    /// the panel's own doze, rather than being put out.
+    pub always_on: bool,
     pub install: Install,
     pub backup: Backup,
     pub logs: Logs,
@@ -126,6 +129,7 @@ impl Settings {
             vibrate: state.vibrate,
             vibration: state.vibration,
             file_transfer: state.file_transfer,
+            always_on: state.always_on,
             install: Install { check_signature: state.check_signature, keep_recovery: state.keep_recovery },
             backup: Backup {
                 parts: names(&state.backup, &PARTS),
@@ -184,6 +188,7 @@ impl Settings {
             state.vibration = self.vibration;
         }
         state.file_transfer = self.file_transfer;
+        state.always_on = self.always_on;
         state.check_signature = self.install.check_signature;
         state.keep_recovery = self.install.keep_recovery;
         state.backup = picked(&self.backup.parts, &PARTS);
@@ -308,6 +313,7 @@ mod tests {
             vibrate: false,
             vibration: 0.4,
             file_transfer: false,
+            always_on: false,
             check_signature: true,
             keep_recovery: false,
             backup: [false, true, true, false],
@@ -323,6 +329,7 @@ mod tests {
         kept.apply(&mut back);
         assert_eq!(Settings::of(&back), Settings::of(&state));
         assert_eq!((back.lang, back.screen_off, back.time_zone), (Lang::En, 6, 7));
+        assert!(!back.always_on, "the face on a dark panel is kept off too");
     }
 
     #[test]
@@ -335,6 +342,7 @@ mod tests {
         assert_eq!(json["backup"]["parts"], serde_json::json!(["boot", "modem"]));
         assert_eq!(json["logs"]["to"], "temporary");
         assert_eq!(json["spoken"], "zh-Hans");
+        assert_eq!(json["always_on"], true, "the face on a dark panel is on until turned off");
         assert!(json.get("language").is_none(), "no language is chosen until one is");
         let never = Settings::of(&State { screen_off: SCREEN_OFF.len() - 1, ..State::default() });
         assert_eq!(never.screen_off, 0, "a screen that stays on");

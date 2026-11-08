@@ -195,9 +195,16 @@ impl Offer {
 }
 
 /// A service the computer asked to open.
+///
+/// None of these names the file the computer sends. `adb sideload` says how
+/// long its package is and in what blocks it serves it, and nothing else:
+/// the name the user gave it stays on the computer. So the name a package is
+/// served under here cannot be the one it was sent with, and a package a
+/// computer sends is served under the fixed name the recovery gives it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Service {
     /// `sideload-host:<size>:<block size>`: send a package block by block.
+    /// The name of the package is not among them.
     SideloadHost(Offer),
     /// `sideload:<size>`: send the whole package in one go, as adb did
     /// before Android 4.4.

@@ -3,6 +3,17 @@
 //! is as they are read. A block read again must hash as it did the first
 //! time, so whoever reads the file sees one package even if the copy it
 //! comes from changes underneath.
+//!
+//! When what is being served has a name of its own — a file the phone
+//! already holds does — the package is served under that name beside
+//! package.zip, which stays where it was for anything already reading it.
+//! The name matters because install scripts work out what they are
+//! installing from the name of the path they are handed:
+//! ZIPNAME=$(basename "$ZIPFILE"), then .zip off the end, is how the zips
+//! these scripts come in are built. A script handed one fixed name for every
+//! package names every phone's update "package". Android's own recovery
+//! hands such a script the name of the package file, and so does this one
+//! wherever it has a name to hand over.
 
 use crate::adb::{Connection, Link, Offer, MAX_BLOCKS};
 use anyhow::{anyhow, Context, Result};
@@ -22,10 +33,46 @@ pub const PACKAGE: &str = "/sideload/package.zip";
 /// Looking this name up stops the filesystem; it is how the installer
 /// ends it from another thread.
 pub const EXIT: &str = "/sideload/exit";
+/// The longest name a file may have, as Linux has it.
+pub const NAME_MAX: usize = 255;
+
+/// The name of the file a package is served as, when it is known. It stays
+/// one path name and no more: nothing about it may reach outside the mount
+/// point, so a name with a separator in it, or one that would read as a
+/// path of its own, is no name to serve a package under and is given up
+/// for package.zip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Name(String);
+
+impl Name {
+    /// `name` as a name to serve a package under, if it is one.
+    pub fn new(name: &str) -> Option<Name> {
+        let well_formed = !name.is_empty()
+            && name.len() <= NAME_MAX
+            && name != "."
+            && name != ".."
+            && name != "exit"
+            && !name.contains(['/', '\0']);
+        well_formed.then(|| Name(name.to_string()))
+    }
+
+    /// The name of the file at `path`: the last part of it, when that is a
+    /// name a package may be served under.
+    pub fn of(path: &Path) -> Option<Name> {
+        path.file_name().and_then(std::ffi::OsStr::to_str).and_then(Name::new)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 const ROOT_ID: u64 = 1;
 const PACKAGE_ID: u64 = 2;
 const EXIT_ID: u64 = 3;
+/// The package as the name of the file the computer sent, where it is
+/// served under one; the same bytes as PACKAGE_ID, under another name.
+const NAMED_ID: u64 = 4;
 
 /// File types in a mode, as Linux numbers them.
 const S_IFDIR: u32 = 0o040000;
@@ -110,6 +157,9 @@ pub(crate) fn file_block(size: u64) -> u32 {
 /// The filesystem's state: the package's blocks as served so far.
 pub struct Server {
     offer: Offer,
+    /// The name the package is served under beside package.zip, when it
+    /// came with one.
+    name: Option<Name>,
     /// Each block's hash from the first time it was read.
     hashes: Vec<Option<[u8; 32]>>,
     /// The block in `block`, kept for the read that comes back for it.
@@ -122,9 +172,11 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new(offer: Offer) -> Server {
+    pub fn new(offer: Offer, name: Option<Name>) -> Server {
         Server {
             offer,
+            // The name package.zip is not one to serve under twice.
+            name: name.filter(|name| name.as_str() != "package.zip"),
             hashes: vec![None; offer.blocks() as usize],
             current: None,
             block: vec![0; offer.block_size as usize],
@@ -153,8 +205,13 @@ impl Server {
             }
             fuse_opcode::FUSE_LOOKUP => {
                 let name = body.split(|&b| b == 0).next().unwrap_or_default();
+                // The package answers to the name it came with as well as to
+                // package.zip: the kernel checks the name it looked up against
+                // the one the filesystem holds, so the two cannot be one node.
+                let named = self.name.as_ref().is_some_and(|served| served.as_str().as_bytes() == name);
                 match (header.nodeid, name) {
                     (ROOT_ID, b"package.zip") => Handled::Reply(reply(unique, self.entry(PACKAGE_ID).as_bytes())),
+                    (ROOT_ID, _) if named => Handled::Reply(reply(unique, self.entry(NAMED_ID).as_bytes())),
                     (ROOT_ID, b"exit") => Handled::Exit(reply(unique, self.entry(EXIT_ID).as_bytes())),
                     _ => Handled::Reply(error(unique, libc::ENOENT)),
                 }
@@ -172,12 +229,12 @@ impl Server {
                 None => Handled::Reply(error(unique, libc::ENOENT)),
             },
             fuse_opcode::FUSE_OPEN => Handled::Reply(match header.nodeid {
-                PACKAGE_ID => reply(unique, fuse_open_out::default().as_bytes()),
+                node if self.serves(node) => reply(unique, fuse_open_out::default().as_bytes()),
                 EXIT_ID => error(unique, libc::EPERM),
                 _ => error(unique, libc::ENOENT),
             }),
             fuse_opcode::FUSE_READ => {
-                if header.nodeid != PACKAGE_ID {
+                if !self.serves(header.nodeid) {
                     return Ok(Handled::Reply(error(unique, libc::ENOENT)));
                 }
                 let (read, _) = fuse_read_in::read_from_prefix(body).map_err(|_| anyhow!("a short READ"))?;
@@ -210,11 +267,18 @@ impl Server {
     fn attr(&self, node: u64) -> Option<fuse_attr> {
         let (size, mode) = match node {
             ROOT_ID => (4096, S_IFDIR | 0o555),
-            PACKAGE_ID => (self.offer.size, S_IFREG | 0o444),
+            node if self.serves(node) => (self.offer.size, S_IFREG | 0o444),
             EXIT_ID => (0, S_IFREG),
             _ => return None,
         };
         Some(fuse_attr { ino: node, size, blocks: size.div_ceil(512), mode, nlink: 1, blksize: 4096, ..Default::default() })
+    }
+
+    /// Whether `node` is the package, under either of the names it is served
+    /// under. The name it came with is not one when it came with none, and
+    /// then there is no such file to read or to open.
+    fn serves(&self, node: u64) -> bool {
+        node == PACKAGE_ID || (node == NAMED_ID && self.name.is_some())
     }
 
     fn entry(&self, node: u64) -> fuse_entry_out {
@@ -286,7 +350,7 @@ pub use device::{mount, Mount, Mounted};
 
 #[cfg(target_os = "android")]
 mod device {
-    use super::{Fault, Handled, Server, Source, EXIT, MOUNT_POINT};
+    use super::{Fault, Handled, Name, Server, Source, EXIT, MOUNT_POINT, PACKAGE};
     use crate::adb::Offer;
     use anyhow::{Context, Result};
     use std::ffi::CString;
@@ -294,7 +358,7 @@ mod device {
     use std::io::{ErrorKind, Read, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use std::thread::{self, JoinHandle};
@@ -307,16 +371,19 @@ mod device {
     pub struct Mounted {
         dev: File,
         offer: Offer,
+        name: Option<Name>,
     }
 
     /// The filesystem, served from a thread of its own out of `S`.
     pub struct Mount<S> {
         thread: JoinHandle<(S, Result<Option<Fault>>)>,
         served: Arc<AtomicU64>,
+        path: PathBuf,
     }
 
-    /// Mount the package `offer` describes at /sideload, read-only.
-    pub fn mount(offer: Offer) -> Result<Mounted> {
+    /// Mount the package `offer` describes at /sideload, read-only, served
+    /// under `name` as well as under package.zip where there is one.
+    pub fn mount(offer: Offer, name: Option<Name>) -> Result<Mounted> {
         let point = Path::new(MOUNT_POINT);
         if !point.try_exists().with_context(|| format!("look for {MOUNT_POINT}"))? {
             fs::create_dir(point).with_context(|| format!("create {MOUNT_POINT}"))?;
@@ -342,7 +409,7 @@ mod device {
         if unsafe { libc::mount(source.as_ptr(), target.as_ptr(), kind.as_ptr(), flags, data.as_ptr().cast()) } != 0 {
             return Err(std::io::Error::last_os_error()).context("mount the package at /sideload");
         }
-        Ok(Mounted { dev, offer })
+        Ok(Mounted { dev, offer, name })
     }
 
     impl Mounted {
@@ -350,16 +417,23 @@ mod device {
         pub fn serve<S: Source + Send + 'static>(self, source: S) -> Mount<S> {
             let served = Arc::new(AtomicU64::new(0));
             let reach = served.clone();
+            // What is handed to whatever reads the package: the name it came
+            // with where it has one, so that a script naming what it installs
+            // from the path it is given sees the file the computer sent.
+            let path = match &self.name {
+                Some(name) => Path::new(MOUNT_POINT).join(name.as_str()),
+                None => PathBuf::from(PACKAGE),
+            };
             let thread = thread::Builder::new()
                 .name("sideload-fuse".into())
                 .spawn(move || {
                     let mut source = source;
-                    let mut server = Server::new(self.offer);
+                    let mut server = Server::new(self.offer, self.name);
                     let result = serve(&self.dev, &mut server, &mut source, &reach);
                     (source, result.map(|()| server.fault().cloned()))
                 })
                 .expect("the FUSE thread starts");
-            Mount { thread, served }
+            Mount { thread, served, path }
         }
     }
 
@@ -398,6 +472,12 @@ mod device {
         /// How far into the package reads have reached.
         pub fn served(&self) -> u64 {
             self.served.load(Ordering::Relaxed)
+        }
+
+        /// Where the package is to be read from: the name it was sent under,
+        /// or package.zip where it came with none.
+        pub fn path(&self) -> &Path {
+            &self.path
         }
 
         /// Stop serving and unmount. The source always comes back; the
@@ -462,7 +542,13 @@ mod tests {
     }
 
     fn server_for(package: &[u8]) -> Server {
-        Server::new(Offer { size: package.len() as u64, block_size: 4096 })
+        Server::new(Offer { size: package.len() as u64, block_size: 4096 }, None)
+    }
+
+    /// The same package, served under the name of the file the computer
+    /// sent as well as under package.zip.
+    fn server_named_for(package: &[u8], name: Name) -> Server {
+        Server::new(Offer { size: package.len() as u64, block_size: 4096 }, Some(name))
     }
 
     /// Fetching the blocks of `package`, counting the fetches.
@@ -493,6 +579,72 @@ mod tests {
         assert!(matches!(exit, Handled::Exit(_)));
         let forget = server.handle(&request_raw(fuse_opcode::FUSE_FORGET, PACKAGE_ID, &[0; 8]), &mut fetch).unwrap();
         assert_eq!(forget, Handled::Silent);
+    }
+
+    #[test]
+    fn the_package_answers_to_the_name_it_was_sent_under() {
+        let (pkg, fetches) = (package(), Cell::new(0));
+        let name = Name::new("ishtar-ota-OS3.0.306.0.WMACNXM.zip").unwrap();
+        let (mut server, mut fetch) = (server_named_for(&pkg, name.clone()), fetch_from(&pkg, &fetches));
+        // The name the computer sent, as the kernel looks it up.
+        let lookup = request_raw(fuse_opcode::FUSE_LOOKUP, ROOT_ID, b"ishtar-ota-OS3.0.306.0.WMACNXM.zip\0");
+        let (h, body) = split(server.handle(&lookup, &mut fetch).unwrap());
+        assert_eq!(h.error, 0);
+        let (entry, _) = fuse_entry_out::read_from_prefix(&body).unwrap();
+        assert_eq!((entry.nodeid, entry.attr.size, entry.attr.mode), (NAMED_ID, 10_240, S_IFREG | 0o444));
+        // package.zip still is, and still is its own node: the kernel checks
+        // the name it asked for against the one the filesystem answers with.
+        let lookup = request_raw(fuse_opcode::FUSE_LOOKUP, ROOT_ID, b"package.zip\0");
+        let (_, body) = split(server.handle(&lookup, &mut fetch).unwrap());
+        let (entry, _) = fuse_entry_out::read_from_prefix(&body).unwrap();
+        assert_eq!(entry.nodeid, PACKAGE_ID);
+        // Reading under the name reads the same package.
+        let read = request(fuse_opcode::FUSE_READ, NAMED_ID, &fuse_read_in { offset: 0, size: 64, ..Default::default() });
+        let (h, body) = split(server.handle(&read, &mut fetch).unwrap());
+        assert_eq!((h.error, body), (0, pkg[..64].to_vec()));
+        let open = request(fuse_opcode::FUSE_OPEN, NAMED_ID, &fuse_open_in::default());
+        assert_eq!(split(server.handle(&open, &mut fetch).unwrap()).0.error, 0);
+    }
+
+    #[test]
+    fn a_package_with_no_name_is_served_under_the_fixed_one_only() {
+        let (pkg, fetches) = (package(), Cell::new(0));
+        let (mut server, mut fetch) = (server_for(&pkg), fetch_from(&pkg, &fetches));
+        let lookup = request_raw(fuse_opcode::FUSE_LOOKUP, ROOT_ID, b"ishtar-ota.zip\0");
+        assert_eq!(split(server.handle(&lookup, &mut fetch).unwrap()).0.error, -libc::ENOENT);
+        // The node a name would have is not a file at all: nothing can look
+        // it up, so nothing may open it or read it either.
+        let getattr = request(fuse_opcode::FUSE_GETATTR, NAMED_ID, &[0u8; 0]);
+        assert_eq!(split(server.handle(&getattr, &mut fetch).unwrap()).0.error, -libc::ENOENT);
+        let open = request(fuse_opcode::FUSE_OPEN, NAMED_ID, &fuse_open_in::default());
+        assert_eq!(split(server.handle(&open, &mut fetch).unwrap()).0.error, -libc::ENOENT);
+        let read = request(fuse_opcode::FUSE_READ, NAMED_ID, &fuse_read_in { offset: 0, size: 64, ..Default::default() });
+        assert_eq!(split(server.handle(&read, &mut fetch).unwrap()).0.error, -libc::ENOENT);
+    }
+
+    #[test]
+    fn only_a_single_path_name_is_a_name_to_serve_a_package_under() {
+        assert_eq!(Name::new("ishtar-ota.zip").map(|n| n.as_str().to_string()), Some("ishtar-ota.zip".into()));
+        assert_eq!(Name::new("../../etc/passwd"), None, "a path of its own");
+        assert_eq!(Name::new("a/b.zip"), None);
+        assert_eq!(Name::new("."), None);
+        assert_eq!(Name::new(".."), None);
+        assert_eq!(Name::new("exit"), None, "the filesystem stop request keeps its own name");
+        assert_eq!(Name::new(""), None);
+        assert_eq!(Name::new("nul\0byte"), None);
+        assert_eq!(Name::new(&"n".repeat(NAME_MAX)).map(|n| n.as_str().len()), Some(NAME_MAX));
+        assert_eq!(Name::new(&"n".repeat(NAME_MAX + 1)), None);
+    }
+
+    #[test]
+    fn the_name_of_a_file_the_phone_holds_is_taken_from_its_path() {
+        let named = |path: &str| Name::of(Path::new(path)).map(|n| n.as_str().to_string());
+        assert_eq!(named("/sdcard/Download/ishtar-ota.zip"), Some("ishtar-ota.zip".into()));
+        // The last part of a path is what it is called, whatever holds it.
+        assert_eq!(named("/sdcard/Download"), Some("Download".into()));
+        assert_eq!(named("ishtar-ota.zip"), Some("ishtar-ota.zip".into()), "a path with no folder to it");
+        assert_eq!(named("/"), None, "a path whose last part is the root");
+        assert_eq!(named(".."), None);
     }
 
     #[test]
@@ -548,7 +700,7 @@ mod tests {
     #[test]
     fn a_failed_fetch_fails_the_read() {
         let offer = Offer { size: 10_240, block_size: 4096 };
-        let mut server = Server::new(offer);
+        let mut server = Server::new(offer, None);
         let mut fetch = |_: u64, _: &mut [u8]| Err("USB: the computer closed the stream".to_string());
         let (h, _) = split(server.handle(&read_request(0, 4096), &mut fetch).unwrap());
         assert_eq!(h.error, -libc::EIO);
@@ -577,7 +729,7 @@ mod tests {
         let (mut file, offer) = LocalFile::open(&path).unwrap();
         assert_eq!(offer, Offer { size: 150_000, block_size: FILE_BLOCK });
         assert!(offer.check().is_ok());
-        let mut server = Server::new(offer);
+        let mut server = Server::new(offer, None);
         let mut fetch = |index: u64, out: &mut [u8]| file.read_block(index, out);
         // Across the first block into the second, and the short last one.
         let (h, body) = split(server.handle(&read_request(65_000, 1_000), &mut fetch).unwrap());
@@ -595,7 +747,7 @@ mod tests {
         std::fs::write(&path, vec![7u8; 200_000]).unwrap();
         let (mut file, offer) = LocalFile::open(&path).unwrap();
         std::fs::File::options().write(true).open(&path).unwrap().set_len(70_000).unwrap();
-        let mut server = Server::new(offer);
+        let mut server = Server::new(offer, None);
         let mut fetch = |index: u64, out: &mut [u8]| file.read_block(index, out);
         let (h, _) = split(server.handle(&read_request(65_536, 4096), &mut fetch).unwrap());
         assert_eq!(h.error, -libc::EIO);

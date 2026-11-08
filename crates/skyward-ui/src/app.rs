@@ -553,6 +553,9 @@ pub enum Switch {
     /// over.
     KeepRecovery,
     Wlan,
+    /// Show the clock and the phone's readings on a dark panel, in the
+    /// panel's own doze, rather than putting the panel out.
+    AlwaysOn,
     /// Show the password typed rather than a dot for each character.
     ShowPassword,
 }
@@ -1122,6 +1125,10 @@ pub enum Action {
     Skip,
     /// Try opening the data partition again, after it did not open.
     OpenData,
+    /// Ask for `user`'s screen lock on the decrypt page, for a user whose
+    /// own files are still closed while the owner's are open: a second
+    /// space's, a cloned app's. The page then asks for it like any other.
+    UnlockUser(u32),
     Back,
     Theme { dark: bool },
     Toggle(Switch),
@@ -1542,6 +1549,14 @@ pub struct State {
     pub vibration: f32,
     /// A computer connected over USB is offered internal storage.
     pub file_transfer: bool,
+    /// A dark panel keeps the clock and the phone's readings on the glass in
+    /// the panel's own doze, rather than being put out. A phone whose panel
+    /// has no doze of its own shows nothing either way, and the switch is
+    /// not offered on it.
+    pub always_on: bool,
+    /// This phone's panel has a doze of its own, which the settings page then
+    /// offers a switch for.
+    pub panel_dozes: bool,
     pub reboot: usize,
     /// What the wipe page has chosen, by place in [`WIPES`].
     pub wipe: [bool; WIPES.len()],
@@ -1604,6 +1619,16 @@ pub struct State {
     /// lock its users' own files wait on.
     pub data: Data,
     pub code: String,
+    /// The users whose own files are still closed beyond the one the page
+    /// waits on: a second space's, a cloned app's. The owner's files open
+    /// first, and these do not hold the recovery; the decrypt page offers
+    /// each by name, and the file manager says so where a folder of one is
+    /// opened. Each with the control its screen lock is answered with.
+    pub others: Vec<(u32, Keys)>,
+    /// At least one user's files remain closed, including a profile whose
+    /// generated credential could not be opened. Whole-data backups and
+    /// restores require every user's key even when owner storage is open.
+    pub closed_users: bool,
     /// What is typed in the search field.
     pub search: String,
     /// The on-screen keyboard's layer.
@@ -1698,6 +1723,8 @@ impl Default for State {
             vibrate: true,
             vibration: SLIDER_START,
             file_transfer: true,
+            always_on: true,
+            panel_dozes: false,
             reboot: 0,
             wipe: [false; WIPES.len()],
             cache_partition: false,
@@ -1727,6 +1754,8 @@ impl Default for State {
             next_slot: None,
             data: Data::Closed,
             code: String::new(),
+            others: Vec::new(),
+            closed_users: false,
             search: String::new(),
             layer: Layer::Letters,
             held: None,
@@ -3191,14 +3220,19 @@ impl App {
         self.dirty = true;
     }
 
-    /// The data partition is open: every user's own files with it, or
-    /// those of `waiting`, the user and the control their screen lock is
-    /// answered with, still closed.
-    pub fn data_waiting(&mut self, waiting: Option<(u32, Keys)>) {
+    /// The data partition is open: the owner's own files with it, or
+    /// `waiting`, the user the page asks a screen lock for and the control
+    /// it is answered with, still closed. `others` are the users beyond it
+    /// whose own files are still closed, offered by name rather than asked
+    /// for: the owner came to open the owner's files, and a second space
+    /// does not hold the recovery at its prompt.
+    pub fn data_waiting(&mut self, waiting: Option<(u32, Keys)>, others: Vec<(u32, Keys)>) {
+        self.state.closed_users = waiting.is_some() || !others.is_empty();
         self.state.data = match waiting {
             Some((user, keys)) => Data::Locked { user, keys, checking: false },
             None => Data::Open,
         };
+        self.state.others = others;
         self.state.code.clear();
         self.refresh();
     }
@@ -3497,6 +3531,16 @@ impl App {
         }
     }
 
+    /// The phone has a WLAN, and the recovery brings it up as it starts, as
+    /// the phone's own system does: the page shows the radio coming up
+    /// rather than a switch that is off, and how it goes comes back with
+    /// [`App::set_wlan`]. A WLAN that does not come up says why on its page
+    /// and in the kernel log, and the other pages are not held up by it.
+    pub fn start_wlan(&mut self) {
+        self.state.wlan = Some(Wlan { power: Power::Starting, ..Wlan::default() });
+        self.refresh();
+    }
+
     /// How the WLAN stands, as the runtime last told it.
     pub fn set_wlan(&mut self, w: Wlan) {
         if self.state.wlan.as_ref() == Some(&w) {
@@ -3533,7 +3577,11 @@ impl App {
             data: match self.state.data {
                 Data::Erased => None,
                 Data::Open => Some(true),
-                Data::Closed | Data::Opening | Data::Failed(_) | Data::Locked { .. } => Some(false),
+                // The owner is user 0: once the owner's own files are open
+                // the phone's storage reads, whatever a second space's user
+                // still waits on.
+                Data::Locked { user, .. } => Some(user != 0),
+                Data::Closed | Data::Opening | Data::Failed(_) => Some(false),
             },
             slot: info.slot.map(Slot::letter),
             temp: battery.and_then(|b| b.temp),
@@ -5000,6 +5048,15 @@ impl App {
                 return self.arrive_at(s);
             }
             Action::OpenData => return self.open_data(),
+            // A user offered by name: the page asks for their screen lock,
+            // as it does for the owner's.
+            Action::UnlockUser(user) => {
+                if let Some((_, keys)) = self.state.others.iter().find(|(u, _)| *u == user).copied() {
+                    self.state.data = Data::Locked { user, keys, checking: false };
+                    self.state.code.clear();
+                    self.refresh();
+                }
+            }
             Action::Skip => {
                 self.leave(true);
                 if self.stack.len() > 1 {
@@ -5035,6 +5092,7 @@ impl App {
                     Switch::Signature => &mut self.state.check_signature,
                     Switch::KeepRecovery => &mut self.state.keep_recovery,
                     Switch::ShowPassword => &mut self.state.show_password,
+                    Switch::AlwaysOn => &mut self.state.always_on,
                     Switch::Wlan => unreachable!("the WLAN switch is turned above"),
                 };
                 *on = !*on;
@@ -6315,7 +6373,7 @@ impl App {
                 let s = &self.state;
                 let refused = if !s.backup.contains(&true) {
                     Some(["请选择要备份的内容", "請選擇要備份的內容", "Choose what to back up"])
-                } else if s.backup[2] && s.data != Data::Open {
+                } else if s.backup[2] && (s.data != Data::Open || s.closed_users) {
                     Some(["备份 data 分区需先完成「解密」", "備份 data 分割區需先完成「解密」", "Decrypt before backing up the data partition"])
                 } else if s.place_open(s.backup_to) {
                     None
@@ -6338,7 +6396,7 @@ impl App {
                 let restore = Effect::Restore { place: entry.place, name: entry.name.clone(), parts: *parts };
                 if !parts.contains(&true) {
                     self.say(l.pick(["请选择要恢复的内容", "請選擇要還原的內容", "Choose what to restore"]), now);
-                } else if parts[2] && self.state.data != Data::Open {
+                } else if parts[2] && (self.state.data != Data::Open || self.state.closed_users) {
                     self.say(l.pick(["恢复 data 分区需先完成「解密」", "還原 data 分割區需先完成「解密」", "Decrypt before restoring the data partition"]), now);
                 } else {
                     fx.push(restore);
@@ -7168,27 +7226,40 @@ mod tests {
         };
         assert_eq!(lock(&mut app, Data::Locked { user: 0, keys: Keys::Digits, checking: false }), Some(false), "shut while its files are out of reach");
         assert_eq!(lock(&mut app, Data::Open), Some(true));
+        assert_eq!(
+            lock(&mut app, Data::Locked { user: 999, keys: Keys::Digits, checking: false }),
+            Some(true),
+            "the owner's files are open behind a second space's lock"
+        );
         assert_eq!(lock(&mut app, Data::Erased), None, "nothing to open once wiped");
         let none = app.bar("12:00", &info());
         assert_eq!((none.slot, none.temp), (None, None), "a phone without slots or a fuel gauge");
     }
 
-    /// A screen the home page's rows fit on with a little room to spare.
-    const SNUG: u32 = 3000;
+    /// A screen as tall as the home page's rows need, with a little room to
+    /// spare. Measured from the page rather than written down, so that a row
+    /// added to the page moves it with them.
+    fn snug(f: &Fonts, i: &DeviceInfo) -> u32 {
+        let mut app = App::new(Screen::Home, W, H * 2, PPD);
+        let fr = app.frame(f, i);
+        let last = fr.hits.iter().map(|h| h.rect.y + h.rect.h).fold(0.0f32, f32::max);
+        (last + 8.0).ceil() as u32
+    }
 
     #[test]
     fn a_home_page_grown_by_an_update_notice_scrolls_down_to_its_last_row() {
         let f = fonts();
         let plain = info();
-        let mut app = App::new(Screen::Home, W, SNUG, PPD);
+        let snug = snug(&f, &plain);
+        let mut app = App::new(Screen::Home, W, snug, PPD);
         let fr = app.frame(&f, &plain);
         let reboot = fr.hits.iter().find(|h| h.action == Action::Open(Screen::Reboot)).expect("a reboot row").rect;
-        assert!(reboot.y + reboot.h <= SNUG as f32, "without the notice the rows fit the screen");
+        assert!(reboot.y + reboot.h <= snug as f32, "without the notice the rows fit the screen");
         let i = DeviceInfo { snapshot: SnapshotState::Snapshotted, ..info() };
-        let mut app = App::new(Screen::Home, W, SNUG, PPD);
+        let mut app = App::new(Screen::Home, W, snug, PPD);
         let fr = app.frame(&f, &i);
         let reboot = fr.hits.iter().find(|h| h.action == Action::Open(Screen::Reboot)).expect("a reboot row").rect;
-        assert!(reboot.y + reboot.h > SNUG as f32, "the notice pushes the last row below the screen");
+        assert!(reboot.y + reboot.h > snug as f32, "the notice pushes the last row below the screen");
         assert!(reboot.y + reboot.h <= fr.canvas.h as f32, "the page is drawn down to it");
         app.touch(Touch::Down(700.0, 2800.0), &f, 0);
         app.touch(Touch::Move(700.0, 2000.0), &f, 0);
@@ -7198,7 +7269,7 @@ mod tests {
             app.tick(ms);
         }
         let (_, y) = spot(&mut app, &f, &i, Action::Open(Screen::Reboot));
-        assert!(y < SNUG as f32, "scrolled up into view");
+        assert!(y < snug as f32, "scrolled up into view");
         tap_at(&mut app, &f, &i, Action::Open(Screen::Reboot), 3000);
         assert_eq!(app.screen(), Screen::Reboot);
     }
@@ -7893,6 +7964,24 @@ mod tests {
     }
 
     #[test]
+    fn the_always_on_switch_shows_only_on_a_panel_that_dozes_and_turns_it() {
+        let (f, i) = (fonts(), info());
+        let offered = |app: &mut App| app.frame(&f, &i).hits.iter().any(|h| h.action == Action::Toggle(Switch::AlwaysOn));
+        let mut app = App::new(Screen::Settings, W, H, PPD);
+        assert!(!offered(&mut app), "a panel with no doze of its own has nothing to keep on the glass");
+        // A phone whose panel does doze offers the switch, and it starts on.
+        app.state.panel_dozes = true;
+        app.refresh();
+        assert!(offered(&mut app), "the switch is among the page's controls");
+        assert!(app.state.always_on, "the face shows unless it is turned off");
+        // The switch is worked the way any other on the page is.
+        app.act(Action::Toggle(Switch::AlwaysOn), 1000);
+        assert!(!app.state.always_on, "the switch turns it off");
+        app.act(Action::Toggle(Switch::AlwaysOn), 2000);
+        assert!(app.state.always_on, "and on again");
+    }
+
+    #[test]
     fn scrolling_back_down_past_the_top_pulls_from_the_top() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Settings, W, H, PPD);
@@ -8480,16 +8569,17 @@ mod tests {
     #[test]
     fn the_keys_reach_the_last_row_of_a_home_page_grown_by_an_update_notice() {
         let f = fonts();
+        let snug = snug(&f, &info());
         let i = DeviceInfo { snapshot: SnapshotState::Snapshotted, ..info() };
-        let mut app = App::new(Screen::Home, W, SNUG, PPD);
+        let mut app = App::new(Screen::Home, W, snug, PPD);
         let (_, y) = spot(&mut app, &f, &i, Action::Open(Screen::Reboot));
-        assert!(y > SNUG as f32, "below the screen to start with");
+        assert!(y > snug as f32, "below the screen to start with");
         light_on(&mut app, &f, &i, Stop::Hit(Action::Open(Screen::Reboot)));
         for ms in (0..3000).step_by(8) {
             app.tick(ms);
         }
         let (_, y) = spot(&mut app, &f, &i, Action::Open(Screen::Reboot));
-        assert!(y < SNUG as f32, "the page scrolled the lit row into view");
+        assert!(y < snug as f32, "the page scrolled the lit row into view");
         press(&mut app, Key::Power, 3000);
         assert_eq!(app.screen(), Screen::Reboot);
     }
@@ -8700,7 +8790,7 @@ mod tests {
     fn the_keys_join_a_patterns_dots_and_end_it_on_the_last_one_joined() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Decrypt, W, H, PPD);
-        app.data_waiting(Some((0, Keys::Pattern)));
+        app.data_waiting(Some((0, Keys::Pattern)), Vec::new());
         app.frame(&f, &i);
         press(&mut app, Key::VolumeDown, 0);
         assert_eq!(lit(&mut app, &f, &i), Some(Stop::Dot(0)), "the grid's first dot is lit first");
@@ -8736,7 +8826,7 @@ mod tests {
     fn the_keys_type_a_screen_locks_code_on_its_keypad() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Decrypt, W, H, PPD);
-        app.data_waiting(Some((0, Keys::Digits)));
+        app.data_waiting(Some((0, Keys::Digits)), Vec::new());
         app.frame(&f, &i);
         for ch in ['2', '5', '8', '0'] {
             light_on(&mut app, &f, &i, Stop::Hit(Action::Type(Cap::Char(ch))));
@@ -9000,7 +9090,7 @@ mod tests {
     fn a_zip_runs_its_install_script_once_agreed_to_and_shows_what_it_says() {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Install, &f, &i);
-        app.data_waiting(None);
+        app.data_waiting(None, Vec::new());
         tap(&mut app, &f, &i, Action::Open(Screen::Choose(Place::Storage)));
         app.set_place(Place::Storage, String::new(), Ok(vec![entry("rom.zip", FileKind::File)]), LISTED);
         assert_eq!(tap(&mut app, &f, &i, Action::ChooseEntry(0)), vec![Effect::InstallFile(Place::Storage, "rom.zip".into())]);
@@ -9202,7 +9292,7 @@ mod tests {
         assert!(tap(&mut app, &f, &i, Action::ExportLogs).is_empty(), "internal storage waits for the data partition");
         app.tick(1000);
         assert_eq!(app.deadline(1000), Some(TOAST_MS), "and says so");
-        app.data_waiting(None);
+        app.data_waiting(None, Vec::new());
         assert_eq!(tap(&mut app, &f, &i, Action::ExportLogs), vec![Effect::ExportLogs { recovery: false, kernel: true, storage: true }]);
         tap(&mut app, &f, &i, Action::LogPart(1));
         assert!(tap(&mut app, &f, &i, Action::ExportLogs).is_empty(), "nothing ticked, nothing saved");
@@ -9229,12 +9319,15 @@ mod tests {
         assert!(swipe(&mut app, &f, &i, Confirm::Backup).is_empty(), "internal storage waits for the data partition");
         assert_eq!(app.deadline(0), Some(TOAST_MS), "and says so");
         // The owner's files open first; another user's still wait.
-        app.data_waiting(Some((10, Keys::Digits)));
+        app.data_waiting(Some((10, Keys::Digits)), Vec::new());
         let first = Effect::Backup { parts: [true, true, false, true], place: Place::Storage, compress: false, verify: true };
         assert_eq!(swipe(&mut app, &f, &i, Confirm::Backup), vec![first]);
         tap(&mut app, &f, &i, Action::BackupPart(2));
         assert!(swipe(&mut app, &f, &i, Confirm::Backup).is_empty(), "the data partition is backed up only with every user's files open");
-        app.data_waiting(None);
+        app.data_waiting(None, vec![(999, Keys::Digits)]);
+        assert!(app.state.data.storage_open(), "owner storage is available while the profile stays locked");
+        assert!(swipe(&mut app, &f, &i, Confirm::Backup).is_empty(), "a locked profile still prevents a whole-data backup");
+        app.data_waiting(None, Vec::new());
         tap(&mut app, &f, &i, Action::BackupPart(0));
         assert_eq!(app.state.backup, [false, true, true, true]);
         tap(&mut app, &f, &i, Action::BackupTo(Place::UsbDrive));
@@ -9311,7 +9404,7 @@ mod tests {
         tap(&mut app, &f, &i, Action::OpenBackup(0));
         assert!(swipe(&mut app, &f, &i, Confirm::Restore).is_empty());
         assert_eq!(app.deadline(0), Some(TOAST_MS), "the page says to decrypt first");
-        app.data_waiting(None);
+        app.data_waiting(None, Vec::new());
         let fx = swipe(&mut app, &f, &i, Confirm::Restore);
         assert!(matches!(&fx[..], [Effect::Restore { parts: [false, false, true, false], .. }]), "{fx:?}");
     }
@@ -9336,7 +9429,7 @@ mod tests {
     fn a_backup_is_deleted_once_a_swipe_confirms_it() {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Restore, &f, &i);
-        app.data_waiting(None);
+        app.data_waiting(None, Vec::new());
         let entry = found(Place::Storage, 1_792_348_260, [true; 4]);
         app.set_backups(vec![entry.clone()]);
         tap(&mut app, &f, &i, Action::OpenBackup(0));
@@ -9366,7 +9459,7 @@ mod tests {
     fn backing_up_shows_how_far_it_has_come_and_stops_when_asked() {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Backup, &f, &i);
-        app.data_waiting(None);
+        app.data_waiting(None, Vec::new());
         app.backup_started(false, Place::Storage, true);
         assert_eq!(app.screen(), Screen::BackupJob);
         app.key(Key::Back, 0);
@@ -9439,9 +9532,9 @@ mod tests {
         assert_eq!(tap(&mut app, &f, &i, Action::Open(Screen::Decrypt)), vec![Effect::OpenData], "no swipe first");
         assert_eq!(app.state.data, Data::Opening);
         assert!(!keys_shown(&mut app, &f, &i) && app.frame(&f, &i).pattern.is_none(), "nothing to answer yet");
-        app.data_waiting(Some((0, Keys::Pattern)));
+        app.data_waiting(Some((0, Keys::Pattern)), Vec::new());
         assert!(app.frame(&f, &i).pattern.is_some(), "the owner set a pattern, so the grid shows");
-        app.data_waiting(Some((0, Keys::Digits)));
+        app.data_waiting(Some((0, Keys::Digits)), Vec::new());
         assert!(keys_shown(&mut app, &f, &i), "for a code, the keypad");
         app.key(Key::Back, 0);
         assert!(tap(&mut app, &f, &i, Action::Open(Screen::Decrypt)).is_empty(), "open already, it is not opened again");
@@ -9465,7 +9558,7 @@ mod tests {
     fn the_code_typed_on_the_keypad_is_sent_once_and_checked_before_more_is_taken() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Decrypt, W, H, PPD);
-        app.data_waiting(Some((0, Keys::Digits)));
+        app.data_waiting(Some((0, Keys::Digits)), Vec::new());
         for ch in "1234".chars() {
             tap(&mut app, &f, &i, Action::Type(Cap::Char(ch)));
         }
@@ -9480,7 +9573,7 @@ mod tests {
         app.unlock_failed("the secure world does not recognise that credential".into(), 0);
         assert!(keys_shown(&mut app, &f, &i), "turned down, it is asked for again");
         assert_eq!(app.deadline(0), Some(TOAST_MS), "with why");
-        app.data_waiting(None);
+        app.data_waiting(None, Vec::new());
         assert_eq!(app.state.data, Data::Open);
     }
 
@@ -9488,7 +9581,7 @@ mod tests {
     fn nothing_typed_is_not_sent() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Decrypt, W, H, PPD);
-        app.data_waiting(Some((0, Keys::Digits)));
+        app.data_waiting(Some((0, Keys::Digits)), Vec::new());
         assert!(tap(&mut app, &f, &i, Action::Type(Cap::Enter)).is_empty());
         assert_eq!(app.deadline(0), Some(TOAST_MS), "the page says to type one first");
     }
@@ -9497,7 +9590,7 @@ mod tests {
     fn a_pattern_is_sent_as_the_numbers_of_the_dots_it_joins() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Decrypt, W, H, PPD);
-        app.data_waiting(Some((0, Keys::Pattern)));
+        app.data_waiting(Some((0, Keys::Pattern)), Vec::new());
         let (cx, cy, span) = app.frame(&f, &i).pattern.expect("the grid is on the page");
         let dots = widgets::pattern_dots(cx, cy, span);
         let scroll = app.top().1;
@@ -9515,7 +9608,7 @@ mod tests {
     fn a_pattern_too_short_to_be_one_is_not_sent() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Decrypt, W, H, PPD);
-        app.data_waiting(Some((0, Keys::Pattern)));
+        app.data_waiting(Some((0, Keys::Pattern)), Vec::new());
         let (cx, cy, span) = app.frame(&f, &i).pattern.expect("the grid is on the page");
         let dots = widgets::pattern_dots(cx, cy, span);
         let scroll = app.top().1;
@@ -9724,7 +9817,7 @@ mod tests {
         let mut app = opened(Screen::Install, &f, &i);
         // Closed, the storage leads to the decrypt page, which comes back.
         assert_eq!(tap(&mut app, &f, &i, Action::Open(Screen::Decrypt)), vec![Effect::OpenData]);
-        app.data_waiting(None);
+        app.data_waiting(None, Vec::new());
         tap(&mut app, &f, &i, Action::Skip);
         assert_eq!(app.screen(), Screen::Install);
         let storage = Screen::Choose(Place::Storage);
@@ -9788,7 +9881,7 @@ mod tests {
     fn a_file_waits_for_the_install_before_it_to_end() {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Install, &f, &i);
-        app.data_waiting(None);
+        app.data_waiting(None, Vec::new());
         tap(&mut app, &f, &i, Action::Open(Screen::Choose(Place::Storage)));
         app.set_place(Place::Storage, String::new(), Ok(vec![entry("ota.zip", FileKind::File)]), LISTED);
         app.state.install = Install::Ending;
@@ -10297,6 +10390,57 @@ mod tests {
                 reach: Some(Reach::Online),
             }),
         )
+    }
+
+    #[test]
+    fn the_wlan_comes_up_with_the_recovery_rather_than_by_a_switch() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        assert!(!app.frame(&f, &i).hits.iter().any(|h| h.action == Action::Open(Screen::Wlan)), "a phone whose WLAN is not brought up has no WLAN");
+        // The runtime starts the radio as the pages come up, saying so first.
+        app.start_wlan();
+        assert_eq!(fmt::wlan_value(Lang::Hans, app.state.wlan.as_ref().unwrap()), "正在开启");
+        assert!(app.frame(&f, &i).hits.iter().any(|h| h.action == Action::Open(Screen::Wlan)), "the WLAN is there from the first frame");
+        // Its page shows the radio coming up, and nothing to turn on: the
+        // switch already reads as on, so tapping it turns the radio off.
+        app.state.wlan = Some(Wlan { power: Power::Starting, ..Wlan::default() });
+        assert!(app.act(Action::Open(Screen::Wlan), 0).is_empty(), "a WLAN still coming up is not scanned");
+        assert_eq!(app.screen(), Screen::Wlan);
+        // Told it is up, the page shows what is in range and it is scanned.
+        app.set_wlan(Wlan { power: Power::On, networks: Vec::new(), joined: None });
+        assert_eq!(fmt::wlan_value(Lang::Hans, app.state.wlan.as_ref().unwrap()), "未连接");
+        assert_eq!(app.arrive(), vec![Effect::ScanWlan], "the page scans by itself once the radio is up");
+    }
+
+    #[test]
+    fn a_wlan_that_does_not_come_up_shows_why_and_leaves_the_pages_alone() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.start_wlan();
+        // The thread could not bring the radio up, and says why: the page
+        // carries the reason, and the pages around it go on as before.
+        app.set_wlan(Wlan { power: Power::Failed("no wlan0 in 20 seconds".into()), ..Wlan::default() });
+        assert_eq!(fmt::wlan_value(Lang::Hans, app.state.wlan.as_ref().unwrap()), "已关闭");
+        app.act(Action::Open(Screen::Wlan), 0);
+        assert_eq!(app.screen(), Screen::Wlan);
+        let t = app.theme();
+        let drawn = pages::render(Screen::Wlan, &Ctx { t: &t, f: &f, info: &i, state: &app.state, term: None, band: None });
+        assert!(drawn.canvas.data.iter().any(|&b| b != 0), "the WLAN page draws with no radio behind it");
+        assert_eq!(app.key(Key::Back, 0), Vec::<Effect>::new(), "leaving it costs nothing");
+        assert_eq!(app.screen(), Screen::Home, "the other pages are reachable");
+    }
+
+    #[test]
+    fn a_wlan_switch_still_turns_the_radio_off_and_on_after_it_came_up_by_itself() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.start_wlan();
+        app.set_wlan(Wlan { power: Power::On, networks: Vec::new(), joined: None });
+        app.act(Action::Open(Screen::Wlan), 0);
+        assert_eq!(tap(&mut app, &f, &i, Action::Toggle(Switch::Wlan)), vec![Effect::Wlan(false)], "the switch still turns it off");
+        assert_eq!(app.state.wlan.as_ref().unwrap().power, Power::Off, "and says so at once");
+        assert_eq!(tap(&mut app, &f, &i, Action::Toggle(Switch::Wlan)), vec![Effect::Wlan(true)], "and on again");
+        assert_eq!(app.state.wlan.as_ref().unwrap().power, Power::Starting);
     }
 
     #[test]
@@ -10937,7 +11081,7 @@ mod tests {
         // Without a tap of the motor where the settings turn it off, and into
         // the gallery once internal storage is open.
         app.state.vibrate = false;
-        app.data_waiting(None);
+        app.data_waiting(None, Vec::new());
         app.key(Key::Power, 3000);
         assert_eq!(app.key(Key::VolumeDown, 3010), vec![Effect::Screenshot { storage: true }]);
     }

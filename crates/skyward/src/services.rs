@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 /// A program that ends sooner than this after starting waits this long
 /// before it is started again.
-const RESTART_DELAY: Duration = Duration::from_secs(1);
+const RESTART_DELAY: Duration = Duration::from_secs(5);
 
 /// How long a program gets to become what it says it will be.
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
@@ -43,13 +43,20 @@ pub fn start(services: &[Service], libraries: Option<&Path>) -> Result<()> {
     let known = ueventd::accounts(&ueventd::PASSWD_FILES.iter().chain(&ueventd::GROUP_FILES).copied().collect::<Vec<_>>());
     for s in services {
         if !Path::new(&s.path).is_file() {
-            bail!("{} is missing; is its partition mounted?", s.path);
+            skyward_sys::kmsg(&format!("{} is missing; it is not started", s.path))?;
+            continue;
         }
         let mut s = s.clone();
         if let Some(dir) = libraries {
             s.libraries.push(dir.to_string_lossy().into_owned());
         }
-        let who = Credentials::of(&s, &known)?;
+        let who = match Credentials::of(&s, &known) {
+            Ok(who) => who,
+            Err(e) => {
+                skyward_sys::kmsg(&format!("{}: its credentials are not available, so it is not started: {e:#}", s.path))?;
+                continue;
+            }
+        };
         if s.oneshot {
             let sockets = listeners(&s, &known)?;
             let status = command(&s, &who, &sockets).status().with_context(|| format!("run {}", s.path))?;
@@ -61,7 +68,9 @@ pub fn start(services: &[Service], libraries: Option<&Path>) -> Result<()> {
         let name = Path::new(&s.path).file_name().map_or_else(|| s.path.clone(), |n| n.to_string_lossy().into_owned());
         let accounts = known.clone();
         thread::Builder::new().name(name).spawn(move || supervise(&s, &who, &accounts)).context("start a supervising thread")?;
-        ready(&waiting)?;
+        if let Err(e) = ready(&waiting) {
+            skyward_sys::kmsg(&format!("{e:#}"))?;
+        }
     }
     Ok(())
 }

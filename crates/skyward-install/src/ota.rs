@@ -2,15 +2,16 @@
 //! update package: how it is started, and what it reports while it works.
 
 use crate::package::Update;
+use std::path::Path;
 
 /// Where the recovery ramdisk keeps it.
 pub const PROGRAM: &str = "/system/bin/update_engine_sideload";
 
 /// Its arguments for `update`, read from the file `package`; it writes
 /// its status lines to `status_fd`.
-pub fn arguments(package: &str, update: &Update, status_fd: i32) -> Vec<String> {
+pub fn arguments(package: &Path, update: &Update, status_fd: i32) -> Vec<String> {
     vec![
-        format!("--payload=file://{package}"),
+        format!("--payload=file://{}", package.display()),
         format!("--offset={}", update.payload_offset),
         format!("--headers={}", update.properties),
         format!("--status_fd={status_fd}"),
@@ -121,7 +122,7 @@ mod tests {
             metadata: Metadata::default(),
         };
         assert_eq!(
-            arguments("/sideload/package.zip", &update, 9),
+            arguments(Path::new("/sideload/package.zip"), &update, 9),
             [
                 "--payload=file:///sideload/package.zip",
                 "--offset=2365",

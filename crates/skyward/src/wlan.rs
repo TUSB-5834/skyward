@@ -690,21 +690,51 @@ fn bring_up(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
 
 /// Put a file the driver asks for where the firmware loader looks.
 fn place(file: &Firmware) -> Result<()> {
+    place_firmware(file)
+}
+
+/// Put a file a driver asks the kernel's firmware loader for where the
+/// loader looks, read out of the running recovery or off the partition the
+/// file is kept on. The motor's driver asks for its own the same way, and
+/// ends its probe without it.
+pub(crate) fn place_firmware(file: &Firmware) -> Result<()> {
     let to = Path::new(FIRMWARE).join(&file.name);
     let dir = to.parent().expect("a firmware file is in a folder");
     fs::create_dir_all(dir).with_context(|| format!("make {}", dir.display()))?;
     let bytes = match &file.partition {
         None => fs::read(&file.path).with_context(|| format!("read {}", file.path))?,
         Some(partition) => {
-            let at = Path::new(PARTITIONS).join(partition);
-            fs::create_dir_all(&at).with_context(|| format!("make {}", at.display()))?;
-            skyward_block::mount::mount_ro(&Path::new(skyward_block::BY_NAME).join(partition), &at)?;
-            let read = fs::read(at.join(&file.path)).with_context(|| format!("read {} on {partition}", file.path));
-            skyward_block::mount::umount(&at)?;
-            read?
+            // The partition may already be mounted where the phone's own
+            // table mounts it, as the configuration's [partitions] asks for
+            // persist: a second mount of the same device is refused while
+            // one is there, whatever is asked of it. Read through that one
+            // first, and mount the partition only when it is nowhere.
+            if let Some(bytes) = read_through_mount(partition, &file.path) {
+                bytes?
+            } else {
+                let at = Path::new(PARTITIONS).join(partition);
+                fs::create_dir_all(&at).with_context(|| format!("make {}", at.display()))?;
+                skyward_block::mount::mount_ro(&Path::new(skyward_block::BY_NAME).join(partition), &at)?;
+                let read = fs::read(at.join(&file.path)).with_context(|| format!("read {} on {partition}", file.path));
+                skyward_block::mount::umount(&at)?;
+                read?
+            }
         }
     };
     fs::write(&to, bytes).with_context(|| format!("write {}", to.display()))
+}
+
+/// `path` on `partition` read through a mount the phone's own table already
+/// has, when an earlier mount of that partition puts the file within reach.
+/// `None` when the partition is mounted nowhere and has to be mounted.
+fn read_through_mount(partition: &str, path: &str) -> Option<Result<Vec<u8>>> {
+    let at = skyward_block::fstab::mount_point(partition).ok().flatten()?;
+    let file = at.join(path);
+    // A partition that is mounted somewhere is read through that mount even
+    // when the file is not the one expected: mounting it a second time is
+    // refused while the first is there, so the read's own reason is the one
+    // worth having.
+    Some(fs::read(&file).with_context(|| format!("read {} through {}", file.display(), at.display())))
 }
 
 /// Start the supplicant on the interface, and wait for its control socket.

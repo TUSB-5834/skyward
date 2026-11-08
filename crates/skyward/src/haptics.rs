@@ -5,7 +5,7 @@ use std::f32::consts::{FRAC_PI_2, TAU};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -85,7 +85,14 @@ impl Haptics {
     /// only as it is played.
     pub fn open(cfg: &skyward_config::Haptics) -> Result<Haptics> {
         let (path, dev) = motor()?;
-        let hz = resonance(&cfg.resonance)?;
+        let hz = match cfg.resonance.as_deref().map(resonance).transpose() {
+            Ok(Some(hz)) => hz,
+            Ok(None) => 172.4,
+            Err(e) => {
+                let _ = skyward_sys::kmsg(&format!("the motor's resonance is not read, so 172.4 Hz is used: {e:#}"));
+                172.4
+            }
+        };
         let click = match cfg.click {
             Some(id) => {
                 eprintln!("haptics {}: clicks with waveform {id}, ticks made for a motor swinging at {hz} Hz", path.display());
@@ -161,6 +168,76 @@ pub fn probe(cfg: &skyward_config::Haptics, position: f32, ticks: bool) -> Resul
     println!("played the {what} at {strength:.3} of the full strength, {} ms long", length.as_millis());
     Ok(())
 }
+
+/// Bring the motor's driver up: put the firmware it asks the kernel's loader
+/// for where the loader looks, then load the modules it is in. A driver the
+/// phone's own init loaded already has spent its probe on the empty folder
+/// its recovery leaves; putting the firmware there does not try it again, so
+/// the device is unbound from its driver and bound back to it, which probes
+/// it afresh with the file now in place.
+pub fn bring_up(cfg: &skyward_config::Haptics, sources: &[String]) -> Result<()> {
+    for file in &cfg.firmware {
+        crate::wlan::place_firmware(file)?;
+    }
+    if !cfg.modules.is_empty() {
+        let dirs = sources.iter().map(|s| skyward_modules::source_dir(s)).collect::<Result<Vec<_>>>()?;
+        for path in skyward_modules::load(&dirs, &cfg.modules)? {
+            skyward_sys::kmsg(&format!("loaded {} for the motor", path.display()))?;
+        }
+    }
+    // Only a driver that asked for firmware and went without it has to be
+    // prodded; one that probed cleanly made its device already.
+    if !cfg.firmware.is_empty() && !any_motor() {
+        reprobe(cfg)?;
+    }
+    Ok(())
+}
+
+/// Unbind each of the configured drivers from its device and bind it back,
+/// so the driver probes the motor again now its firmware is where the loader
+/// looks. The drivers are found by the names the kernel gives them under
+/// /sys/bus/i2c/drivers, which drop the suffix a module's file name carries:
+/// cs40l26-i2c is the driver cs40l26.
+fn reprobe(cfg: &skyward_config::Haptics) -> Result<()> {
+    for module in &cfg.modules {
+        let driver = driver_name(module);
+        let at = Path::new("/sys/bus/i2c/drivers").join(&driver);
+        let Ok(listing) = fs::read_dir(&at) else { continue };
+        let bound: Vec<_> = listing.flatten().map(|e| e.file_name()).filter(|n| n.to_string_lossy().contains('-')).collect();
+        for name in &bound {
+            let name = name.to_string_lossy();
+            let _ = fs::write(at.join("unbind"), name.as_ref());
+            let _ = fs::write(at.join("bind"), name.as_ref());
+            skyward_sys::kmsg(&format!("bound {driver} to {name} again so it probes the motor with its firmware"))?;
+        }
+    }
+    // The device node and its force-feedback device appear as the probe
+    // runs, which is not synchronous with the write above.
+    let until = std::time::Instant::now() + PROBE_WAIT;
+    while std::time::Instant::now() < until {
+        if any_motor() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Ok(())
+}
+
+/// The kernel's name for the driver a module is in: the module's own name
+/// without the bus it sits on, as cs40l26-i2c is the driver cs40l26 and
+/// cs40l26-core is none.
+fn driver_name(module: &str) -> String {
+    module.trim_end_matches("-core").trim_end_matches("-i2c").replace('_', "-")
+}
+
+/// Whether any input device takes periodic force-feedback effects yet.
+fn any_motor() -> bool {
+    evdev::raw_stream::enumerate().any(|(_, dev)| takes_periodic(&dev))
+}
+
+/// How long a driver may take to make its force-feedback device once bound
+/// to the motor again.
+const PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// The first input device under /dev/input that takes periodic
 /// force-feedback effects, opened for writing.

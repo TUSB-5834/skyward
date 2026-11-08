@@ -721,15 +721,37 @@ pub mod kms {
             let fastest = (mode.vrefresh() != preferred.vrefresh()).then_some(blob);
 
             let ids: Vec<u32> = planes.iter().map(|p| u32::from(p.0)).collect();
+            // What the connector and the CRTC were left holding, read back: the
+            // link's own settings are the driver's, and a sub-pixel block that
+            // was asked for but did not arrive is worth telling apart from one
+            // that did. This line is the only place a phone with the pages up
+            // can say either.
+            let link = match Props::read(&card, conn.handle()) {
+                Ok(props) => ["dsc_mode", "bpp_mode", "frame_trigger_mode"]
+                    .into_iter()
+                    .filter_map(|name| props.value(name).ok().map(|value| format!("{name}={value}")))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                Err(_) => String::from("?"),
+            };
+            let held = match &spr {
+                Some((_, _, name)) => {
+                    let value = Props::read(&card, crtc).ok().and_then(|props| props.value(name).ok()).unwrap_or(0);
+                    match card.get_property_blob(value) {
+                        Ok(blob) if !blob.is_empty() => format!("{name}, {} bytes held", blob.len()),
+                        _ => format!("{name}, nothing held"),
+                    }
+                }
+                None => String::from("-"),
+            };
             let summary = format!(
-                "{:?} connector {} mode {:?} {w}x{h} {} Hz, crtc {}, planes {ids:?} {:?}{}",
+                "{:?} connector {} mode {:?} {w}x{h} {} Hz, crtc {}, planes {ids:?} {:?}, link {link}, sub-pixel rendering {held}",
                 conn.interface(),
                 u32::from(conn.handle()),
                 mode.name(),
                 mode.vrefresh(),
                 u32::from(crtc),
-                fourcc,
-                spr.as_ref().map(|(_, _, name)| format!(", sub-pixel rendering through {name}")).unwrap_or_default()
+                fourcc
             );
             let spr = spr.map(|(id, setup, _)| (id, setup));
             let lp = match conn_props.get("LP") {

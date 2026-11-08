@@ -100,6 +100,16 @@ pub fn device(entry: &Entry) -> Result<String> {
     anyhow::bail!("neither {path} nor {} is here", by_name.display())
 }
 
+/// Where the partition `name` is mounted, when an earlier mount — this run's
+/// own [mount] or the recovery service starting again — already has it
+/// somewhere. `None` when nothing has mounted it yet, however the phone's own
+/// table says it would be.
+pub fn mount_point(name: &str) -> Result<Option<PathBuf>> {
+    let Some(entry) = partition(name)? else { return Ok(None) };
+    let at = PathBuf::from(&entry.mount_point);
+    Ok(crate::mount::is_mount_point(&at)?.then_some(at))
+}
+
 /// Mount the partition `name` where and as the phone's own table mounts
 /// it, and say where. Whatever shows there already, as what an earlier run
 /// of the recovery service mounted does, is taken as it is.
