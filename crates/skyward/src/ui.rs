@@ -1050,19 +1050,18 @@ fn read_avb(cfg: &DeviceConfig) -> Result<AvbStatus, String> {
     read().map_err(|e| format!("{e:#}"))
 }
 
-fn disable_avb(cfg: &DeviceConfig) -> Result<AvbStatus, String> {
-    let disable = || -> Result<AvbStatus> {
+fn set_avb_verity(cfg: &DeviceConfig, disabled: bool) -> Result<AvbStatus, String> {
+    let change = || -> Result<AvbStatus> {
         ensure!(avb_unlocked()?, "the bootloader is locked or its unlock state is unknown");
         let update = skyward_vab::snapshot_state()?;
         ensure!(update == skyward_vab::SnapshotState::None, "an update is in flight or its state is unknown ({update:?})");
-        // The referenced device tree does not enable ALL_DISABLED.
-        // Its manual action changes verity alone. Changing boot
-        // verification has not been validated on dada.
-        let partitions = avb::disable(Path::new(skyward_block::BY_NAME), avb_suffixes(cfg), avb::Checks::default())?;
-        let _ = skyward_sys::kmsg("the selected vbmeta checks are disabled; reboot for them to take effect");
+        // Changing boot verification has not been validated on dada.
+        // This switch always changes the verity bit alone.
+        let partitions = avb::set_verity(Path::new(skyward_block::BY_NAME), avb_suffixes(cfg), !disabled)?;
+        let _ = skyward_sys::kmsg(if disabled { "dm-verity disabled; reboot for it to take effect" } else { "dm-verity enabled; reboot for it to take effect" });
         Ok(AvbStatus { unlocked: true, partitions })
     };
-    disable().map_err(|e| format!("{e:#}"))
+    change().map_err(|e| format!("{e:#}"))
 }
 
 /// Have the bootloader start `slot` next and give what the boot control
@@ -2379,12 +2378,12 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     Effect::ReadSlots => app.set_boot_slots(read_slots()),
                     Effect::SetSlot(slot) => app.slot_switched(set_slot(slot), now),
                     Effect::ReadAvb => app.set_avb(read_avb(cfg)),
-                    Effect::DisableAvb => {
-                        let result = disable_avb(cfg);
+                    Effect::SetAvbVerity { disabled } => {
+                        let result = set_avb_verity(cfg, disabled);
                         if result.is_err() {
                             app.set_avb(read_avb(cfg));
                         }
-                        app.avb_disabled(result);
+                        app.avb_changed(result);
                     }
                     // The decrypt page shows meanwhile that the work is
                     // under way, and takes nothing more until it is done.

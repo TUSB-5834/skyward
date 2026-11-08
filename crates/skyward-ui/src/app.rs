@@ -853,7 +853,7 @@ pub enum Confirm {
     Restore,
     /// Start next from the slot chosen on the slot page.
     Slot,
-    DisableAvb,
+    Avb,
     /// Erase all user data, as the system offered when it could not start.
     FactoryReset,
     /// Delete the entry the file page shows.
@@ -1186,6 +1186,8 @@ pub enum Action {
     ExportLogs,
     /// Pick this slot to start next; a swipe then switches to it.
     PickSlot(Slot),
+    /// Select whether dm-verity is disabled; a swipe applies the change.
+    ToggleAvbVerity,
     /// A key of the on-screen keyboard.
     Type(Cap),
     /// A key of the row above the keyboard, the terminal's or the editor's.
@@ -1626,6 +1628,7 @@ pub struct State {
     /// the page shows the one the boot control starts next.
     pub next_slot: Option<Slot>,
     pub avb: Option<Result<AvbStatus, String>>,
+    pub avb_disable_verity: bool,
     pub avb_result: Option<Result<(), String>>,
     /// Where the data partition stands, and what is typed at the screen
     /// lock its users' own files wait on.
@@ -1765,6 +1768,7 @@ impl Default for State {
             boot_slots: None,
             next_slot: None,
             avb: None,
+            avb_disable_verity: false,
             avb_result: None,
             data: Data::Closed,
             code: String::new(),
@@ -1957,7 +1961,7 @@ pub enum Effect {
     /// [`App::slot_switched`].
     SetSlot(Slot),
     ReadAvb,
-    DisableAvb,
+    SetAvbVerity { disabled: bool },
     /// Mount the slot's partition with this base name, such as `system`.
     Mount(String),
     /// Unmount the slot's partition with this base name.
@@ -3844,14 +3848,18 @@ impl App {
     }
 
     pub fn set_avb(&mut self, status: Result<AvbStatus, String>) {
+        if let Ok(status) = &status {
+            self.state.avb_disable_verity = !status.partitions.is_empty()
+                && status.partitions.iter().all(|p| !p.verity_enabled());
+        }
         self.state.avb = Some(status);
         self.refresh();
     }
 
-    pub fn avb_disabled(&mut self, result: Result<AvbStatus, String>) {
+    pub fn avb_changed(&mut self, result: Result<AvbStatus, String>) {
         match result {
             Ok(status) => {
-                self.state.avb = Some(Ok(status));
+                self.set_avb(Ok(status));
                 self.state.avb_result = Some(Ok(()));
             }
             Err(why) => self.state.avb_result = Some(Err(why)),
@@ -5355,6 +5363,11 @@ impl App {
                 self.state.next_slot = Some(slot);
                 self.refresh();
             }
+            Action::ToggleAvbVerity => {
+                self.state.avb_disable_verity = !self.state.avb_disable_verity;
+                self.state.avb_result = None;
+                self.refresh();
+            }
             Action::Type(cap) if self.screen() == Screen::Terminal => return self.term_typed(cap),
             Action::Type(cap) if self.screen() == Screen::Editor => self.edit_typed(cap),
             Action::Type(cap) => return self.type_key(cap, now),
@@ -6449,11 +6462,11 @@ impl App {
                 }
                 _ => self.say(l.pick(["无法读取启动槽位", "無法讀取啟動槽位", "Couldn't read the boot slots"]), now),
             },
-            Confirm::DisableAvb => {
+            Confirm::Avb => {
                 if self.state.avb.as_ref().is_some_and(|s| s.as_ref().is_ok_and(|s| s.unlocked)) {
-                    fx.push(Effect::DisableAvb);
+                    fx.push(Effect::SetAvbVerity { disabled: self.state.avb_disable_verity });
                 } else {
-                    self.say(l.pick(["无法禁用，请确认 Bootloader 已解锁且 AVB 状态可读取", "無法停用，請確認 Bootloader 已解鎖且 AVB 狀態可讀取", "An unlocked bootloader and readable AVB state are required"]), now);
+                    self.say(l.pick(["无法修改，请确认 Bootloader 已解锁且 AVB 状态可读取", "無法修改，請確認 Bootloader 已解鎖且 AVB 狀態可讀取", "An unlocked bootloader and readable AVB state are required"]), now);
                 }
             }
             Confirm::FactoryReset => fx.push(Effect::FactoryReset),

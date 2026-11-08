@@ -126,7 +126,7 @@ pub fn confirm_label(which: Confirm, s: &State) -> (&'static str, bool) {
         Confirm::Backup => (["滑动以备份", "滑動以備份", "Slide to back up"], false),
         Confirm::Restore => (["滑动以恢复", "滑動以還原", "Slide to restore"], true),
         Confirm::Slot => (["滑动以切换", "滑動以切換", "Slide to switch"], true),
-        Confirm::DisableAvb => (["滑动以禁用", "滑動以停用", "Slide to disable"], true),
+        Confirm::Avb => (if s.avb_disable_verity { ["滑动以禁用", "滑動以停用", "Slide to disable"] } else { ["滑动以启用", "滑動以啟用", "Slide to enable"] }, true),
         Confirm::FactoryReset => (["滑动以恢复出厂设置", "滑動以恢復原廠設定", "Slide to factory reset"], true),
         Confirm::DeleteEntry | Confirm::DeleteBackup => (["滑动以删除", "滑動以刪除", "Slide to delete"], true),
         Confirm::Install => (INSTALL, false),
@@ -2214,8 +2214,7 @@ pub fn advanced(cx: &Ctx) -> Frame {
 const RELABEL: Text = ["修复 SELinux 上下文", "修復 SELinux 上下文", "Fix SELinux contexts"];
 const DISABLE_AVB: Text = ["禁用 AVB", "停用 AVB", "Disable AVB"];
 
-/// TWRP's default manual AVB action disables dm-verity alone. Boot
-/// verification remains as read; changing it is not supported by this page.
+/// The switch selects a dm-verity state; a swipe applies it to all targets.
 pub fn avb(cx: &Ctx) -> Frame {
     let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
     let mut c = long_page(cx);
@@ -2239,16 +2238,17 @@ pub fn avb(cx: &Ctx) -> Frame {
     let rows: Vec<Row> = status.partitions.iter().zip(&descriptions).map(|(p, d)| Row::new(&p.partition).subtitle(d).trail(Trail::None)).collect();
     let y = widgets::section_first(&mut c, t, f, top, l.pick(["目标分区", "目標分割區", "Target partitions"]));
     let partitions = widgets::list(&mut c, t, f, y, &rows);
-    let note = l.pick([
-        "按参考 TWRP 的默认方式，仅禁用 dm-verity，不修改启动验证标记。A/B 设备会处理两个槽位，重启后生效；完整系统更新可能恢复验证。",
-        "依照參考 TWRP 的預設方式，僅停用 dm-verity，不修改啟動驗證標記。A/B 裝置會處理兩個槽位，重新啟動後生效；完整系統更新可能恢復驗證。",
-        "Matches the referenced TWRP default: disables dm-verity only and leaves boot verification flags unchanged. Both A/B slots are handled, effective after reboot; a full system update may restore verity.",
+    let y = widgets::section(&mut c, t, f, partitions.bottom, l.pick(["操作", "操作", "Action"]));
+    let choices = widgets::list(&mut c, t, f, y, &[
+        Row::new(l.pick(["禁用 dm-verity", "停用 dm-verity", "Disable dm-verity"]))
+            .trail(Trail::Switch(s.avb_disable_verity)),
     ]);
-    let mut y = widgets::footnote(&mut c, t, f, partitions.bottom, note);
+    out.extend(hits(&choices.rows, &[Action::ToggleAvbVerity]));
+    let mut y = choices.bottom;
     if let Some(result) = &s.avb_result {
         let message = match result {
-            Ok(()) => l.pick(["dm-verity 已禁用，重启后生效。", "dm-verity 已停用，重新啟動後生效。", "dm-verity disabled; reboot for it to take effect."]).to_string(),
-            Err(why) => tr!(l, "禁用失败：{why}", "停用失敗：{why}", "Couldn't disable: {why}"),
+            Ok(()) => l.pick(if s.avb_disable_verity { ["dm-verity 已禁用。", "dm-verity 已停用。", "dm-verity disabled."] } else { ["dm-verity 已启用。", "dm-verity 已啟用。", "dm-verity enabled."] }).to_string(),
+            Err(why) => tr!(l, "修改失败：{why}", "修改失敗：{why}", "Couldn't change: {why}"),
         };
         y = widgets::footnote(&mut c, t, f, y, &message);
     }
@@ -2261,12 +2261,10 @@ pub fn avb(cx: &Ctx) -> Frame {
     };
     if let Some(why) = blocked {
         widgets::footnote(&mut c, t, f, y, &why);
-    } else if status.partitions.iter().any(|p| p.verity_enabled()) {
-        let (label, danger) = confirm_label(Confirm::DisableAvb, s);
+    } else if status.partitions.iter().any(|p| p.verity_enabled() == s.avb_disable_verity) {
+        let (label, danger) = confirm_label(Confirm::Avb, s);
         let track = widgets::confirm(&mut c, t, f, y + t.m.dp(24.0), label, danger, s.confirm);
-        out.push(Hit { rect: track, action: Action::Confirm(Confirm::DisableAvb) });
-    } else {
-        widgets::footnote(&mut c, t, f, y, l.pick(["dm-verity 已禁用。", "dm-verity 已停用。", "dm-verity is already disabled."]));
+        out.push(Hit { rect: track, action: Action::Confirm(Confirm::Avb) });
     }
     Frame::new(t, c, out, title, top)
 }

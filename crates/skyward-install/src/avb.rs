@@ -186,6 +186,11 @@ pub fn disable(dir: &Path, suffixes: &[&str], checks: Checks) -> io::Result<Vec<
     change(dir, suffixes, checks.mask(), false)
 }
 
+/// Set dm-verity on every target without changing boot verification.
+pub fn set_verity(dir: &Path, suffixes: &[&str], enabled: bool) -> io::Result<Vec<State>> {
+    change(dir, suffixes, VERITY_DISABLED, enabled)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,6 +222,25 @@ mod tests {
         set(dir.path(), "_a", VERITY_DISABLED, true).unwrap();
         assert_eq!(read(dir.path(), "_a").unwrap().flags, 0x82);
         assert_eq!(read(dir.path(), "_b").unwrap().flags, 0x83);
+    }
+
+    #[test]
+    fn the_verity_switch_enables_and_disables_both_slots_without_changing_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let originals = [("_a", image(0x82)), ("_b", image(0x80))];
+        for (slot, bytes) in &originals {
+            fs::write(dir.path().join(format!("vbmeta{slot}")), bytes).unwrap();
+        }
+        for enabled in [false, true, false, true] {
+            set_verity(dir.path(), &["_a", "_b"], enabled).unwrap();
+            for (slot, bytes) in &originals {
+                let mut expected = bytes.clone();
+                let original_flags = u32::from_be_bytes(bytes[120..124].try_into().unwrap());
+                let flags = if enabled { original_flags } else { original_flags | VERITY_DISABLED };
+                expected[120..124].copy_from_slice(&flags.to_be_bytes());
+                assert_eq!(fs::read(dir.path().join(format!("vbmeta{slot}"))).unwrap(), expected);
+            }
+        }
     }
 
     #[test]
