@@ -18,6 +18,13 @@ corner_radius = 134
 # compression. Without SPR, blue appears magenta and red appears green.
 spr = "dada-o3"
 
+# Command IDs from this O3 panel's tx_cmd_set_prim listing: the stock
+# low-brightness doze sets DBV 18, and NOLP returns to normal display.
+# Keep the clock's frame on the panel while it is in its own doze.
+[aod]
+enter_cmds = [45]
+leave_cmds = [18]
+
 [modules]
 sources = ["vendor_boot", "vendor_dlkm", "vendor", "system_dlkm"]
 # The touchscreen: Synaptics TouchComm over SPI behind Xiaomi's touch
