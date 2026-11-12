@@ -15,6 +15,8 @@ mod decrypt;
 mod filework;
 #[cfg(target_os = "android")]
 mod haptics;
+#[cfg(any(target_os = "android", all(test, unix)))]
+mod haptics_rtp;
 #[cfg(target_os = "android")]
 mod input;
 #[cfg(target_os = "android")]
@@ -25,6 +27,8 @@ mod partwork;
 mod pty;
 #[cfg(target_os = "android")]
 mod readings;
+#[cfg(any(target_os = "android", all(test, unix)))]
+mod remembered;
 #[cfg(target_os = "android")]
 mod relabel;
 #[cfg(target_os = "android")]

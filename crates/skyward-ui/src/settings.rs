@@ -55,6 +55,11 @@ pub struct Settings {
     /// Missing in older files: use the device's initial choice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub double_tap: Option<bool>,
+    /// Turn both AVB checks off after a ROM is installed.
+    pub disable_avb: bool,
+    /// Remember the screen lock that opens the data partition, and try it
+    /// by itself at the next start.
+    pub remember_password: bool,
     pub install: Install,
     pub backup: Backup,
     pub logs: Logs,
@@ -134,6 +139,8 @@ impl Settings {
             file_transfer: state.file_transfer,
             always_on: state.always_on,
             double_tap: Some(state.double_tap),
+            disable_avb: state.disable_avb,
+            remember_password: state.remember_password,
             install: Install { check_signature: state.check_signature, keep_recovery: state.keep_recovery },
             backup: Backup {
                 parts: names(&state.backup, &PARTS),
@@ -196,6 +203,8 @@ impl Settings {
         if let Some(on) = self.double_tap {
             state.double_tap = on && state.double_taps;
         }
+        state.disable_avb = self.disable_avb;
+        state.remember_password = self.remember_password;
         state.check_signature = self.install.check_signature;
         state.keep_recovery = self.install.keep_recovery;
         state.backup = picked(&self.backup.parts, &PARTS);
@@ -225,6 +234,9 @@ fn picked<const N: usize>(kept: &[String], all: &[&str; N]) -> [bool; N] {
 
 /// What the settings file held as the recovery started.
 #[derive(Debug, Clone, PartialEq)]
+// The settings are read once at the start and stay as one value for the whole
+// recovery, so boxing the big variant would buy nothing.
+#[allow(clippy::large_enum_variant)]
 pub enum Kept {
     Settings(Settings),
     /// No settings: no file, or one that does not read as settings.
@@ -321,6 +333,29 @@ mod tests {
         state.double_taps = false;
         Settings::read(r#"{"double_tap": true}"#).unwrap().apply(&mut state);
         assert!(!state.double_tap, "a kept setting does not invent device support");
+    }
+
+    #[test]
+    fn the_avb_and_remember_switches_are_kept_and_start_off() {
+        // Both change something the owner should have chosen: one the
+        // signatures the bootloader checks, the other a password written
+        // to /metadata. A phone flashed and never visited is neither.
+        let fresh = State::default();
+        assert!(!fresh.disable_avb, "a ROM is installed without turning the checks off");
+        assert!(!fresh.remember_password, "no password is kept unless asked for");
+        assert!(fresh.remembered.is_none());
+
+        // A value the pages set comes back at the next start.
+        let state = State { disable_avb: true, remember_password: true, ..State::default() };
+        let kept = Settings::read(&Settings::of(&state).text()).unwrap();
+        let mut back = State::default();
+        kept.apply(&mut back);
+        assert!(back.disable_avb && back.remember_password);
+        // What was remembered is never written to the settings file: it
+        // lives in its own sealed file, and a settings file copied off
+        // the phone must not carry it.
+        let text = Settings::of(&State { remembered: Some("1234".into()), ..state }).text();
+        assert!(!text.contains("1234"), "the credential is not in the settings file");
     }
 
     #[test]

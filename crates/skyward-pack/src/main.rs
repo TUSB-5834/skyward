@@ -62,6 +62,9 @@ enum Cmd {
         /// statically.
         #[arg(long)]
         system_init: PathBuf,
+        /// A statically linked AArch64 Bash for ROM install scripts.
+        #[arg(long)]
+        bash: PathBuf,
         /// The device configuration, devices/<codename>.toml.
         #[arg(long)]
         config: PathBuf,
@@ -132,7 +135,7 @@ fn main() -> Result<()> {
             img.kernel = BootImage::read(&kernel)?.kernel;
             write(&out, &img, &img.to_bytes()?)
         }
-        Cmd::Recovery { stock, update_skyward, binary, system_init, config, font, mono, mono_license, firmware, modules, omapi, out } => {
+        Cmd::Recovery { stock, update_skyward, binary, system_init, bash, config, font, mono, mono_license, firmware, modules, omapi, out } => {
             let size = partition_size(&stock)?;
             let mut img = BootImage::read(&stock)?;
             let mut rd = Ramdisk::decode(&img.ramdisk)?;
@@ -166,6 +169,11 @@ fn main() -> Result<()> {
             for command in paths::COMMANDS {
                 rd.link(command, recovery)?;
             }
+            let shell = read(&bash)?;
+            static_bash(&shell)?;
+            put(&mut rd, paths::BASH, 0o755, shell, update_skyward)?;
+            rd.link(paths::BASH_LINK, "/system/bin/bash")?;
+            put(&mut rd, paths::BASH_LICENSE, 0o644, include_bytes!("../../../tools/bash/COPYING").to_vec(), update_skyward)?;
             put(&mut rd, paths::SYSTEM_INIT, 0o755, read(&system_init)?, update_skyward)?;
             put(&mut rd, paths::CONFIG, 0o644, read(&config)?, update_skyward)?;
             put(&mut rd, paths::FONT, 0o644, read(&font)?, update_skyward)?;
@@ -213,6 +221,24 @@ fn main() -> Result<()> {
             }
         }
     }
+}
+
+/// Refuse a shell that depends on a loader outside the recovery ramdisk.
+fn static_bash(bytes: &[u8]) -> Result<()> {
+    ensure!(bytes.len() >= 64 && &bytes[..7] == b"\x7fELF\x02\x01\x01", "Bash must be a little-endian ELF64 program");
+    let u16_at = |at| u16::from_le_bytes(bytes[at..at + 2].try_into().expect("a checked ELF header"));
+    let u64_at = |at| u64::from_le_bytes(bytes[at..at + 8].try_into().expect("a checked ELF header"));
+    ensure!(u16_at(18) == 183 && matches!(u16_at(16), 2 | 3), "Bash must be an AArch64 executable");
+    let start = usize::try_from(u64_at(32)).context("Bash program header offset")?;
+    let stride = usize::from(u16_at(54));
+    let count = usize::from(u16_at(56));
+    let end = stride.checked_mul(count).and_then(|size| start.checked_add(size)).context("Bash program headers overflow")?;
+    ensure!(stride >= 56 && count > 0 && start >= 64 && end <= bytes.len(), "Bash has invalid program headers");
+    for entry in bytes[start..end].chunks_exact(stride) {
+        let kind = u32::from_le_bytes(entry[..4].try_into().expect("a checked program header"));
+        ensure!(!matches!(kind, 2 | 3), "Bash must be static, with no interpreter or dynamic libraries");
+    }
+    Ok(())
 }
 
 /// The partition a recovery is made on, as a full update package names it.
@@ -350,6 +376,30 @@ fn list(image: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bash_must_run_without_the_installed_systems_loader() {
+        let mut elf = vec![0u8; 120];
+        elf[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        elf[16..18].copy_from_slice(&2u16.to_le_bytes());
+        elf[18..20].copy_from_slice(&183u16.to_le_bytes());
+        elf[32..40].copy_from_slice(&64u64.to_le_bytes());
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&1u16.to_le_bytes());
+        elf[64..68].copy_from_slice(&1u32.to_le_bytes());
+        static_bash(&elf).unwrap();
+        for kind in [2u32, 3] {
+            elf[64..68].copy_from_slice(&kind.to_le_bytes());
+            assert!(static_bash(&elf).is_err(), "no dynamic section or interpreter");
+        }
+        elf[64..68].copy_from_slice(&1u32.to_le_bytes());
+        elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+        assert!(static_bash(&elf).is_err(), "no host executable");
+        elf[18..20].copy_from_slice(&183u16.to_le_bytes());
+        elf[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(static_bash(&elf).is_err(), "no overflowing headers");
+        assert!(static_bash(b"#!/sbin/sh\n").is_err());
+    }
 
     #[test]
     fn the_lines_that_set_a_name_are_the_only_ones_left_out() {

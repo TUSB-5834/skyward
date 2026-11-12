@@ -62,6 +62,8 @@ pub struct Haptics {
     dev: File,
     click: Click,
     ticks: Click,
+    ticks_share: f32,
+    ticks_rest: Duration,
     strength: Strength,
     /// The click playing, by its slot and its count, until it is taken
     /// away; a click taken away early by the next is not taken away again.
@@ -77,6 +79,8 @@ enum Click {
     /// Samples made at the motor's resonant frequency, which the driver
     /// plays as they are, at `rate` a second.
     Samples { data: Vec<i8>, rate: u32 },
+    /// ODM RTP samples whose amplitude is scaled before each upload.
+    Rtp { data: Vec<i8>, rate: u32 },
 }
 
 impl Haptics {
@@ -93,7 +97,10 @@ impl Haptics {
                 172.4
             }
         };
-        let click = match cfg.click {
+        let click = if let Some(rtp) = &cfg.click_rtp {
+            eprintln!("haptics {}: click RTP {} at {} Hz", path.display(), rtp.path, rtp.rate);
+            load_rtp(rtp)?
+        } else { match cfg.click {
             Some(id) => {
                 eprintln!("haptics {}: clicks with waveform {id}, ticks made for a motor swinging at {hz} Hz", path.display());
                 Click::Kept(id)
@@ -102,9 +109,14 @@ impl Haptics {
                 eprintln!("haptics {}: clicks and ticks made for a motor swinging at {hz} Hz", path.display());
                 Click::Samples { data: made(hz), rate: RATE }
             }
+        } };
+        let (ticks, ticks_share, ticks_rest) = if let Some(rtp) = &cfg.ticks_rtp {
+            eprintln!("haptics {}: screen-off RTP {} at {} Hz", path.display(), rtp.path, rtp.rate);
+            (load_rtp(rtp)?, share(&cfg.strength, 0.5), Duration::ZERO)
+        } else {
+            (Click::Samples { data: ticks(hz), rate: TICKS_RATE }, TICKS_STRENGTH, TICKS_REST)
         };
-        let ticks = Click::Samples { data: ticks(hz), rate: TICKS_RATE };
-        Ok(Haptics { dev, click, ticks, strength: cfg.strength, playing: Arc::new(Mutex::new(None)), clicks: 0 })
+        Ok(Haptics { dev, click, ticks, ticks_share, ticks_rest, strength: cfg.strength, playing: Arc::new(Mutex::new(None)), clicks: 0 })
     }
 
     /// One short click at the strength the slider's `position` gives, after
@@ -113,10 +125,10 @@ impl Haptics {
         self.start(false, share(&self.strength, position))
     }
 
-    /// The ticks of the screen going off, as strong as the phone's own
-    /// system plays them whatever the slider says. Gives how long they play.
+    /// Screen-off feedback: the configured RTP waveform, or the existing
+    /// synthesized ticks on devices without one. Gives how long it plays.
     pub fn ticks(&mut self) -> Result<Duration> {
-        self.start(true, TICKS_STRENGTH)
+        self.start(true, self.ticks_share)
     }
 
     /// Play the ticks, or else the click, at `share` of its full strength,
@@ -128,13 +140,16 @@ impl Haptics {
         }
         let effect = if ticks { &self.ticks } else { &self.click };
         let loaded = upload(&self.dev, effect, share).context("load the click")?;
-        play(&mut self.dev, loaded.slot).context("play the click")?;
+        if let Err(error) = play(&mut self.dev, loaded.slot) {
+            let _ = erase(&self.dev, loaded.slot);
+            return Err(error).context("play the click");
+        }
         self.clicks += 1;
         let this = (loaded.slot, self.clicks);
         *playing = Some(this);
         drop(playing);
         let dev = self.dev.try_clone().context("share the motor")?;
-        let length = loaded.length + if ticks { TICKS_REST } else { Duration::ZERO };
+        let length = loaded.length + if ticks { self.ticks_rest } else { Duration::ZERO };
         // Timed from now: a thread may wait a while before it first runs.
         let until = Instant::now() + length;
         let playing = self.playing.clone();
@@ -158,7 +173,7 @@ impl Haptics {
 pub fn probe(cfg: &skyward_config::Haptics, position: f32, ticks: bool) -> Result<()> {
     let mut haptics = Haptics::open(cfg)?;
     let (what, strength, length) = if ticks {
-        ("ticks", TICKS_STRENGTH, haptics.ticks()?)
+        ("ticks", haptics.ticks_share, haptics.ticks()?)
     } else {
         ("click", share(&cfg.strength, position), haptics.click(position)?)
     };
@@ -260,6 +275,11 @@ fn share(strength: &Strength, position: f32) -> f32 {
     strength.lightest * (strength.strongest / strength.lightest).powf(position.clamp(0.0, 1.0))
 }
 
+fn load_rtp(rtp: &skyward_config::Rtp) -> Result<Click> {
+    let (data,rate) = crate::haptics_rtp::load(rtp)?;
+    Ok(Click::Rtp { data,rate })
+}
+
 /// The motor's resonant frequency in hertz, from the file the driver says
 /// it in, in tenths of a hertz.
 fn resonance(file: &str) -> Result<f32> {
@@ -314,7 +334,7 @@ struct Loaded {
 /// `custom_fifo_data` lays them out.
 #[repr(C)]
 struct Samples {
-    /// Unused by the driver.
+    /// Reserved effect-stream index; raw RTP playback uses zero.
     index: u32,
     length: u32,
     rate: u32,
@@ -332,22 +352,28 @@ fn upload(dev: &File, click: &Click, share: f32) -> Result<Loaded> {
     // it plays into the other two, in whole seconds and then milliseconds.
     let mut kept: [i16; 3] = [0; 3];
     let mut samples = Samples { index: 0, length: 0, rate: RATE, data: std::ptr::null() };
+    // Keep the scaled allocation alive through EVIOCSFF. Full magnitude
+    // avoids applying the user's strength twice on drivers that do honor it.
+    let scaled = match click {
+        Click::Rtp { data, .. } => Some(crate::haptics_rtp::scaled(data, share)),
+        _ => None,
+    };
     let (len, data) = match click {
         Click::Kept(id) => {
             kept[0] = *id;
             (std::mem::size_of_val(&kept), kept.as_mut_ptr())
         }
-        Click::Samples { data, rate } => {
+        Click::Samples { data, rate } | Click::Rtp { data, rate } => {
             samples.length = u32::try_from(data.len())?;
             samples.rate = *rate;
-            samples.data = data.as_ptr();
+            samples.data = scaled.as_deref().unwrap_or(data).as_ptr();
             (std::mem::size_of::<Samples>(), (&mut samples as *mut Samples).cast::<i16>())
         }
     };
     let periodic = libc::ff_periodic_effect {
         waveform: FF_CUSTOM,
         period: 0,
-        magnitude: (share.clamp(0.0, 1.0) * f32::from(i16::MAX)).round() as i16,
+        magnitude: (if matches!(click, Click::Rtp { .. }) { 1.0 } else { share.clamp(0.0, 1.0) } * f32::from(i16::MAX)).round() as i16,
         offset: 0,
         phase: 0,
         envelope: libc::ff_envelope { attack_length: 0, attack_level: 0, fade_length: 0, fade_level: 0 },
@@ -379,7 +405,10 @@ fn upload(dev: &File, click: &Click, share: f32) -> Result<Loaded> {
             length
         }
         // The queue is full before the samples start playing.
-        Click::Samples { data, rate } => Duration::from_secs_f64(data.len() as f64 / f64::from(*rate)),
+        // Qualcomm's public effect-stream HAL waits the sample duration plus
+        // one millisecond before removing it; rounding up avoids truncating
+        // the final sample of an externally loaded RTP waveform.
+        Click::Samples { data, rate } | Click::Rtp { data, rate } => Duration::from_millis((data.len() as u64 * 1000).div_ceil(u64::from(*rate)) + 1),
     };
     Ok(Loaded { slot: effect.id, length })
 }

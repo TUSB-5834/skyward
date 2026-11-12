@@ -1390,6 +1390,11 @@ impl<'a> Row<'a> {
         self.trail = trail;
         self
     }
+    /// The row with a switch at `on`.
+    pub fn switch(mut self, on: bool) -> Self {
+        self.trail = Trail::Switch(on);
+        self
+    }
     pub fn tint(mut self, color: Rgba) -> Self {
         self.tint = Some(color);
         self

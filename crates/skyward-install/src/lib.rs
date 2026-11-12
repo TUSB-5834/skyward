@@ -18,6 +18,8 @@ pub mod signature;
 pub mod upgrade;
 pub mod wipe;
 
+#[cfg(any(target_os = "android", all(test, unix)))]
+mod engine;
 #[cfg(target_os = "android")]
 mod ffs;
 #[cfg(target_os = "android")]
@@ -69,6 +71,16 @@ pub struct Options {
     /// A zip with an install script runs only if it was signed with one of
     /// the keys the phone's updates are signed with.
     pub signed: bool,
+    /// Turn both AVB checks off in the slot the install leaves the phone
+    /// starting from, once it has finished.
+    ///
+    /// This is the recovery's own act rather than the package's: a ROM built
+    /// without the phone's keys makes a locked bootloader refuse to start it,
+    /// and an install script is an arbitrary program that may or may not call
+    /// `avbctl` for itself. What the owner set on the install page decides,
+    /// and an install the system asked for never does it — no one is at the
+    /// screen to have asked.
+    pub disable_avb: bool,
 }
 
 /// What the installer tells the screen, in the order it happens.
@@ -111,6 +123,9 @@ pub enum Event {
     /// The install wrote over this recovery in the recovery partitions,
     /// which the screen asked to keep: how writing it back went.
     Reflashed(Reflash),
+    /// Both AVB checks were to be turned off in the slot the install leaves
+    /// the phone starting from, and how that went.
+    Avb(Avb),
     /// In rescue, the computer asked for all user data to be erased: the
     /// screen erases it and says how that went with [`Command::Wiped`].
     Wipe,
@@ -132,6 +147,18 @@ pub enum Reflash {
     Written(Vec<Slot>),
     /// It could not be, for this reason.
     Failed(String),
+}
+
+/// Turning both AVB checks off after an install, and how it went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Avb {
+    /// The slot whose vbmeta was changed; `None` where the slot the phone
+    /// starts from next could not be read at all.
+    pub slot: Option<Slot>,
+    /// `Ok(None)` where the checks were already off, `Ok(Some(backup))` where
+    /// they were turned off and the image as it was kept at that path, and
+    /// why it did not happen.
+    pub done: Result<Option<String>, String>,
 }
 
 /// How far the work is.

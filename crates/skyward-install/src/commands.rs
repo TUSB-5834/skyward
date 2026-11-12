@@ -13,7 +13,7 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
 
-mod avbctl;
+pub mod avbctl;
 mod resetprop;
 mod sevenzip;
 mod unzip;

@@ -173,6 +173,7 @@ const SPECS: Text = ["全部参数与信息", "全部規格與資訊", "All spec
 const LOGS: Text = ["导出日志", "匯出記錄", "Export logs"];
 const SCREEN_TIMEOUT: Text = ["息屏时间", "螢幕自動關閉", "Screen timeout"];
 const ALWAYS_ON: Text = ["息屏显示", "螢幕關閉顯示", "Always-on display"];
+const REMEMBER_PASSWORD: Text = ["记住解密密码", "記住解密密碼", "Remember the decrypt password"];
 const UPDATE: Text = ["系统更新", "系統更新", "System update"];
 const SKYWARD_UPDATE: Text = ["Skyward 更新", "Skyward 更新", "Skyward update"];
 const FILES: Text = ["文件管理", "檔案管理", "File manager"];
@@ -213,6 +214,10 @@ fn fit(c: Canvas, t: &Theme, bottom: f32) -> Canvas {
 }
 
 fn hits(rects: &[Rect], actions: &[Action]) -> Vec<Hit> {
+    // One action for each row, and no row without one: a list given one
+    // action fewer than it draws leaves its last row dead, which is a control
+    // that does nothing when it is touched and says nothing about why.
+    assert_eq!(rects.len(), actions.len(), "a list draws {} rows and was given {} actions", rects.len(), actions.len());
     rects.iter().zip(actions).map(|(&rect, &action)| Hit { rect, action }).collect()
 }
 
@@ -390,7 +395,7 @@ pub fn settings(cx: &Ctx) -> Frame {
         out.push(Hit { rect: r, action: Action::Open(Screen::ScreenOff) });
     }
     y = widgets::section(&mut c, t, f, slider.bottom, l.pick(["振动", "震動", "Vibration"]));
-    let below = Row::new(l.pick(["触摸振动", "觸控震動", "Touch vibration"])).trail(Trail::Switch(s.vibrate));
+    let below = Row::new(l.pick(["触摸振动", "觸控震動", "Touch vibration"])).switch(s.vibrate);
     let vibration = widgets::slider_card(&mut c, t, f, y, Caption::Vibrate, l.pick(["振动强度", "震動強度", "Vibration intensity"]), s.vibration, Some(below));
     out.push(Hit { rect: vibration.track, action: Action::Slider(Slider::Vibration) });
     if let Some(r) = vibration.below {
@@ -403,7 +408,7 @@ pub fn settings(cx: &Ctx) -> Frame {
     let mut y = vibration.bottom;
     if s.panel_dozes {
         y = widgets::section(&mut c, t, f, y, l.pick(["息屏显示", "螢幕關閉顯示", "Always-on display"]));
-        let on = Row::new(l.pick(ALWAYS_ON)).trail(Trail::Switch(s.always_on));
+        let on = Row::new(l.pick(ALWAYS_ON)).switch(s.always_on);
         let aod = widgets::list(&mut c, t, f, y, &[on]);
         out.extend(hits(&aod.rows, &[Action::Toggle(Switch::AlwaysOn)]));
         let note = l.pick([
@@ -428,7 +433,7 @@ pub fn settings(cx: &Ctx) -> Frame {
     ]);
     out.extend(hits(&general.rows, &[Action::Open(Screen::Language), Action::Open(Screen::TimeZone)]));
     y = widgets::section(&mut c, t, f, general.bottom, "USB");
-    let usb = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(["文件传输", "檔案傳輸", "File transfer"])).icon(BLUE, Icon::Usb).trail(Trail::Switch(s.file_transfer))]);
+    let usb = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(["文件传输", "檔案傳輸", "File transfer"])).icon(BLUE, Icon::Usb).switch(s.file_transfer)]);
     out.extend(hits(&usb.rows, &[Action::Toggle(Switch::FileTransfer)]));
     let note = l.pick([
         "开启后，可在电脑上管理内部存储中的文件，需先完成「解密」。",
@@ -436,6 +441,20 @@ pub fn settings(cx: &Ctx) -> Frame {
         "When on, a computer can manage the files in internal storage, once it is decrypted.",
     ]);
     y = widgets::footnote(&mut c, t, f, usb.bottom, note);
+    // A password kept on the phone is a password someone else may read,
+    // so it is asked for rather than given, and the row says what it costs.
+    if s.data != Data::Erased {
+        let remember = widgets::section(&mut c, t, f, y, l.pick(["解密", "解密", "Decryption"]));
+        let row = Row::new(l.pick(REMEMBER_PASSWORD)).switch(s.remember_password);
+        let rows = widgets::list(&mut c, t, f, remember, &[row]);
+        out.extend(hits(&rows.rows, &[Action::Toggle(Switch::RememberPassword)]));
+        let note = l.pick([
+            "开启后，成功解密 data 的密码会保存在本机密文存储中，下次进入 recovery 自动尝试。关闭开关会删除保存的密码；此保存使用软件加密，知道本机序列号的人仍可恢复密码。",
+            "開啟後，成功解密 data 的密碼會儲存在本機的加密儲存空間，下次進入 recovery 自動嘗試。關閉開關會刪除儲存的密碼；此儲存使用軟體加密，知道本機序列號的人仍可還原密碼。",
+            "When on, the password that opens the data partition is kept on this phone and tried by itself at the next start. Turning this off removes it. This uses software encryption; someone who knows the phone serial can recover it.",
+        ]);
+        y = widgets::footnote(&mut c, t, f, rows.bottom, note);
+    }
     y = widgets::section(&mut c, t, f, y, l.pick(["调试", "偵錯", "Debugging"]));
     let debug = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(TERMINAL)).icon(SLATE, Icon::Terminal)]);
     out.extend(hits(&debug.rows, &[Action::Open(Screen::Terminal)]));
@@ -1042,13 +1061,13 @@ pub fn install(cx: &Ctx) -> Frame {
     });
     let y = widgets::footnote(&mut c, t, f, methods.bottom, what);
     let y = widgets::section(&mut c, t, f, y, l.pick(["选项", "選項", "Options"]));
-    let check = Row::new(l.pick(["验证刷机包签名", "驗證刷機包簽章", "Verify zip signatures"])).trail(Trail::Switch(cx.state.check_signature));
+    let check = Row::new(l.pick(["验证刷机包签名", "驗證刷機包簽章", "Verify zip signatures"])).switch(cx.state.check_signature);
     let signature = widgets::list(&mut c, t, f, y, &[check]);
     out.extend(hits(&signature.rows, &[Action::Toggle(Switch::Signature)]));
     let note = l.pick(["开启后，仅安装带有本机官方签名的刷机包。", "開啟後，僅安裝帶有本機官方簽章的刷機包。", "When on, only zips signed with this phone's official keys install."]);
     let mut y = widgets::footnote(&mut c, t, f, signature.bottom, note);
     if cx.state.recovery_partitions {
-        let row = Row::new(l.pick(["自动重新刷入 Skyward", "自動重新刷入 Skyward", "Flash Skyward again"])).trail(Trail::Switch(cx.state.keep_recovery));
+        let row = Row::new(l.pick(["自动重新刷入 Skyward", "自動重新刷入 Skyward", "Flash Skyward again"])).switch(cx.state.keep_recovery);
         let options = widgets::list(&mut c, t, f, y + t.m.card_gap, &[row]);
         out.extend(hits(&options.rows, &[Action::Toggle(Switch::KeepRecovery)]));
         let note = l.pick([
@@ -1058,6 +1077,24 @@ pub fn install(cx: &Ctx) -> Frame {
         ]);
         y = widgets::footnote(&mut c, t, f, options.bottom, note);
     }
+    // The recovery's own act after an install, not the package's: a ROM
+    // built without this phone's keys will not start on a bootloader that
+    // still checks signatures, and an install script is an arbitrary
+    // program that may or may not disable them for itself.
+    let avb = Row::new(l.pick([
+        "刷入 ROM 后自动禁用 AVB 校验",
+        "刷入 ROM 後自動停用 AVB 驗證",
+        "Disable AVB checks after a ROM is installed",
+    ]))
+    .switch(cx.state.disable_avb);
+    let rows = widgets::list(&mut c, t, f, y + t.m.card_gap, &[avb]);
+    out.extend(hits(&rows.rows, &[Action::Toggle(Switch::DisableAvb)]));
+    let note = l.pick([
+        "安装完成后，本次安装所在槽位的启动验证与 dm-verity 会被关闭，重启后生效。原镜像备份在 /skyward/run。",
+        "安裝完成後，本次安裝所在槽位的啟動驗證與 dm-verity 會被停用，重新啟動後生效。原映像檔備份在 /skyward/run。",
+        "After the install, boot verification and dm-verity are turned off in the slot it installed to, from the next start. The image as it was is kept in /skyward/run.",
+    ]);
+    let y = widgets::footnote(&mut c, t, f, rows.bottom, note);
     Frame::new(t, fit(c, t, y), out, l.pick(["安装", "安裝", "Install"]), top)
 }
 
@@ -1105,6 +1142,7 @@ fn percent(share: f32) -> u32 {
 /// Where an update stands, and the share of its step done when known.
 fn update_stage(l: Lang, stage: Option<&Stage>) -> (String, Option<f32>) {
     match stage {
+        Some(Stage::Writing { total: 0, .. }) => (l.pick(["第 1 步，共 3 步：等待更新程序报告进度", "第 1 步，共 3 步：等待更新程式回報進度", "Step 1 of 3: waiting for update progress"]).into(), None),
         Some(Stage::Writing { done, total }) => {
             let s = share(*done, *total);
             let p = percent(s);
@@ -1165,7 +1203,7 @@ fn script_stage<'a>(l: Lang, stage: Option<&Stage>, said: &'a [String]) -> (&'a 
 /// over, where it did.
 fn reflashed(c: &mut Canvas, cx: &Ctx, y: f32) -> f32 {
     let (t, f, l) = (cx.t, cx.f, cx.state.lang);
-    match &cx.state.reflash {
+    let y = match &cx.state.reflash {
         None => y,
         Some(Reflash::Written(written)) => {
             let slots = fmt::slots(l, written);
@@ -1180,6 +1218,10 @@ fn reflashed(c: &mut Canvas, cx: &Ctx, y: f32) -> f32 {
             let y = widgets::footnote(c, t, f, y, note);
             widgets::footnote(c, t, f, y, why)
         }
+    };
+    match &cx.state.avb_notice {
+        Some(notice) => widgets::footnote(c, t, f, y, notice),
+        None => y,
     }
 }
 
@@ -1969,8 +2011,8 @@ pub fn backup(cx: &Ctx) -> Frame {
     out.extend(hits(&places.rows, &[Action::BackupTo(Place::Storage), Action::BackupTo(Place::UsbDrive)]));
     let y = widgets::section(&mut c, t, f, places.bottom, l.pick(["选项", "選項", "Options"]));
     let options = widgets::list(&mut c, t, f, y, &[
-        Row::new(l.pick(["压缩", "壓縮", "Compress"])).subtitle(l.pick(["备份更小，耗时更长", "備份更小，耗時更長", "Smaller, and slower to make"])).trail(Trail::Switch(s.compress)),
-        Row::new(l.pick(["完成后校验", "完成後驗證", "Verify when done"])).subtitle(l.pick(["确认备份文件完整", "確認備份檔案完整", "Checks the backup's files are whole"])).trail(Trail::Switch(s.verify)),
+        Row::new(l.pick(["压缩", "壓縮", "Compress"])).subtitle(l.pick(["备份更小，耗时更长", "備份更小，耗時更長", "Smaller, and slower to make"])).switch(s.compress),
+        Row::new(l.pick(["完成后校验", "完成後驗證", "Verify when done"])).subtitle(l.pick(["确认备份文件完整", "確認備份檔案完整", "Checks the backup's files are whole"])).switch(s.verify),
     ]);
     out.extend(hits(&options.rows, &[Action::Toggle(Switch::Compress), Action::Toggle(Switch::Verify)]));
     let note = l.pick([
@@ -3061,7 +3103,7 @@ pub fn wlan(cx: &Ctx) -> Frame {
     let mut out = Vec::new();
     let top = t.m.content_top;
     let on = !matches!(w.power, Power::Off | Power::Failed(_));
-    let switch = widgets::list(&mut c, t, f, top, &[Row::new(l.pick(WLAN)).trail(Trail::Switch(on))]);
+    let switch = widgets::list(&mut c, t, f, top, &[Row::new(l.pick(WLAN)).switch(on)]);
     out.extend(hits(&switch.rows, &[Action::Toggle(Switch::Wlan)]));
     let mut y = switch.bottom;
     match &w.power {
@@ -3158,7 +3200,7 @@ pub fn wlan_password(cx: &Ctx) -> Frame {
     let y = widgets::section_first(&mut c, t, f, top, &network.name);
     let shown = if s.show_password { s.password.clone() } else { "•".repeat(s.password.chars().count()) };
     let (y, caret) = widgets::text_field(&mut c, t, f, y, &shown);
-    let show = widgets::list(&mut c, t, f, y + t.m.card_gap, &[Row::new(l.pick(SHOW_PASSWORD)).trail(Trail::Switch(s.show_password))]);
+    let show = widgets::list(&mut c, t, f, y + t.m.card_gap, &[Row::new(l.pick(SHOW_PASSWORD)).switch(s.show_password)]);
     out.extend(hits(&show.rows, &[Action::Toggle(Switch::ShowPassword)]));
     keyboard_hits(&mut c, t, f, s, l.pick(CONNECT_KEY), &mut out);
     Frame { caret: Some(caret), ..Frame::new(t, c, out, l.pick(["输入密码", "輸入密碼", "Enter password"]), top) }
@@ -3192,7 +3234,7 @@ pub fn wlan_add(cx: &Ctx) -> Frame {
         if a.field == Field::Password {
             caret = typed;
         }
-        let show = widgets::list(&mut c, t, f, below + m.card_gap, &[Row::new(l.pick(SHOW_PASSWORD)).trail(Trail::Switch(s.show_password))]);
+        let show = widgets::list(&mut c, t, f, below + m.card_gap, &[Row::new(l.pick(SHOW_PASSWORD)).switch(s.show_password)]);
         out.extend(hits(&show.rows, &[Action::Toggle(Switch::ShowPassword)]));
     }
     keyboard_hits(&mut c, t, f, s, l.pick(CONNECT_KEY), &mut out);
@@ -3460,7 +3502,7 @@ pub fn permissions(cx: &Ctx) -> Frame {
     let special = (l.pick(["特殊权限", "特殊權限", "Special"]), [("SUID", 0o4000), ("SGID", 0o2000), (l.pick(["粘滞位", "黏滯位", "Sticky"]), 0o1000)]);
     for (title, bits) in groups.into_iter().chain([special]) {
         y = widgets::section(&mut c, t, f, y, title);
-        let rows = bits.map(|(name, bit)| Row::new(name).trail(Trail::Switch(mode & bit != 0)));
+        let rows = bits.map(|(name, bit)| Row::new(name).switch(mode & bit != 0));
         let list = widgets::list(&mut c, t, f, y, &rows);
         out.extend(hits(&list.rows, &bits.map(|(_, bit)| Action::ModeBit(bit))));
         y = list.bottom;

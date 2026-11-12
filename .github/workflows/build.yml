@@ -60,12 +60,18 @@ jobs:
         run: |
           sdkmanager "build-tools;37.0.0"
           bash tools/omapi-bridge/build.sh
+      - name: Build the static Bash used by ROM install scripts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu bison
+          bash tools/bash/build.sh
       - name: Gather them
         run: |
           mkdir -p release-tools
           cp target/aarch64-linux-android/release/skyward target/release/skyward-pack release-tools/
           cp tools/omapi-bridge/out/omapi-bridge release-tools/omapi-helper
           cp target/system-init/aarch64-linux-android/release/system-init release-tools/
+          cp tools/bash/out/bash release-tools/
       - uses: actions/upload-artifact@v7
         with:
           name: tools
@@ -136,7 +142,7 @@ jobs:
           mkdir out
           omapi=()
           if [ "$DEVICE" = dada ]; then omapi=(--omapi tools/omapi-helper); fi
-          tools/skyward-pack recovery --stock stock/recovery.img --binary tools/skyward --system-init tools/system-init --config "devices/$DEVICE.toml" \
+          tools/skyward-pack recovery --stock stock/recovery.img --binary tools/skyward --system-init tools/system-init --bash tools/bash --config "devices/$DEVICE.toml" \
             --font resources/fonts/MiSansVF.ttf --mono resources/fonts/KirkMono-Regular.ttf \
             --mono-license resources/fonts/KirkMono-OFL.txt "${omapi[@]}" --out "out/$name.img"
           echo "name=$name" >> "$GITHUB_OUTPUT"

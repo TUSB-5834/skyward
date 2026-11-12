@@ -1102,7 +1102,14 @@ fn detach(services: Vec<Service>) -> Detach {
 /// on a phone that has them, and checks a zip's signature before its
 /// install script runs.
 fn install_options(app: &App) -> Options {
-    Options { keep: app.state.keep_recovery && app.state.recovery_partitions, signed: app.state.check_signature }
+    Options {
+        keep: app.state.keep_recovery && app.state.recovery_partitions,
+        signed: app.state.check_signature,
+        // The system asking for an update never does this: no one is at
+        // the screen to have asked for it, and the install refuses it
+        // on that origin besides.
+        disable_avb: app.state.disable_avb,
+    }
 }
 
 /// How often the WLAN page scans while it shows.
@@ -1289,8 +1296,34 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     // Whether the settings page offers a switch for the panel's own doze: a
     // phone whose panel has one.
     app.state.panel_dozes = cfg.aod.is_some();
+    // The credential an earlier start kept, where remembering is on: offered
+    // on the decrypt page, and tried by the page's own open where it can be.
+    // A phone that turned remembering off, or forgot it, has none.
+    app.state.remembered = if app.state.remember_password { crate::remembered::load() } else { None };
+    if app.state.remember_password && app.state.remembered.is_none() {
+        // Remembering is on and nothing is kept: a wiped /metadata, or a
+        // credential sealed by a phone that is not this one.
+        let _ = skyward_sys::kmsg("remembering the decrypt password is on, and no credential is kept");
+    }
+    // A credential kept from an earlier start is worth nothing unless the data
+    // partition is opened for it: nothing else at a start asks for the owner's
+    // files, so the recovery would sit on the home page with the phone's
+    // storage shut until someone went to the decrypt page — which is the one
+    // thing this switch exists to spare them. So the open is begun here, and
+    // the kept credential goes with it where the phone asks for one.
+    if app.state.remembered.is_some() && decryptor.is_none() && !mount::is_mount_point(Path::new(skyward_crypto::data::MOUNT))? {
+        let _ = skyward_sys::kmsg("a kept credential is here, so the data partition is opened at this start");
+        decryptor = Some(Decryptor::start(decrypt::Job::Open)?);
+    }
     // When the panel gone dark began to rest.
     let mut rested_at: Option<Instant> = None;
+    // The credential just typed, held until the phone says whether it opened
+    // anything: a password a phone turns down is not one to write down.
+    let mut unlock_typed: Option<(u32, String)> = None;
+    // Whether the credential in hand was the one kept from an earlier
+    // start rather than one typed at the page: a kept one the phone
+    // refuses is thrown away, where a typed one is simply wrong.
+    let mut unlock_auto = false;
     // Started for fastboot, the port goes to the phone's own fastbootd. The
     // page says whether it came up and how far a computer has the port;
     // why it did not come up goes to the kernel log and on screen.
@@ -2288,6 +2321,18 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     }
                     closed = opening.closed;
                     show_closed(&mut app, &closed)?;
+                    // The owner's files are still shut and a credential was
+                    // kept for them: try it without asking, which is the whole
+                    // point of the switch. A credential the phone no longer
+                    // takes is thrown away rather than tried at every start.
+                    let owner_shut = closed.iter().any(|c| c.user == 0 && !c.made_up);
+                    if let Some(code) = app.auto_attempt(owner_shut) {
+                        skyward_sys::kmsg("the kept credential is being tried on the data partition")?;
+                        let job = decrypt::Job::Unlock { closed: closed.clone(), user: 0, credential: code.clone().into_bytes() };
+                        decryptor = Some(Decryptor::start(job)?);
+                        unlock_typed = Some((0, code));
+                        unlock_auto = true;
+                    }
                 }
                 decrypt::Ended::Opened(Err(why)) => {
                     skyward_sys::kmsg(&format!("the data partition stays closed: {why}"))?;
@@ -2304,10 +2349,47 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     app.data_failed(why);
                 }
                 decrypt::Ended::Unlocked(Ok(still)) => {
+                    unlock_auto = false;
                     closed = still;
                     show_closed(&mut app, &closed)?;
+                    // What was typed opened the phone's files, so it is the
+                    // credential to keep where the owner asked for it to be
+                    // kept. A second space's password is not the owner's, and
+                    // is not kept.
+                    if let Some((user, code)) = unlock_typed.take() {
+                        if user == 0 && app.state.remember_password && app.state.remembered.as_deref() != Some(code.as_str()) {
+                            // Written here rather than queued as an effect:
+                            // this is what puts the sealed file on /metadata,
+                            // and an effect dropped on the floor is a switch
+                            // that does nothing at all.
+                            match crate::remembered::save(&code) {
+                                Ok(()) => {
+                                    app.state.remembered = Some(code);
+                                    skyward_sys::kmsg("the credential that opened the phone is kept")?;
+                                },
+                                Err(e) => {
+                                    let _ = skyward_sys::kmsg(&format!("the credential is not kept: {e:#}"));
+                                }
+                            }
+                        }
+                    }
                 }
                 decrypt::Ended::Unlocked(Err(why)) => {
+                    use skyward_crypto::credential::Rejection;
+                    // A kept credential the phone will not take is not
+                    // kept any more: the owner changed it, and trying
+                    // it again at every start would only add a refusal
+                    // to the log each time.
+                    if std::mem::take(&mut unlock_auto)
+                        && matches!(why.rejection, Some(Rejection::Incorrect | Rejection::Retry { incorrect: true, .. }))
+                    {
+                        skyward_sys::kmsg(&format!("the kept credential was not taken, and is forgotten: {}", why.details))?;
+                        app.state.remembered = None;
+                        if let Err(e) = crate::remembered::forget() {
+                            let _ = skyward_sys::kmsg(&format!("the refused credential could not be removed: {e:#}"));
+                        }
+                    }
+                    unlock_typed = None;
                     // Which user the credential was for, so that a page
                     // holding the recovery at a second space's prompt is not
                     // read as the owner's own credential being wrong.
@@ -2316,7 +2398,6 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         _ => "the user's own files".to_string(),
                     };
                     let _ = skyward_sys::kmsg(&format!("what was entered did not open {who}: {}", why.details));
-                    use skyward_crypto::credential::Rejection;
                     let l = app.state.lang;
                     let message = match why.rejection {
                         Some(Rejection::Incorrect) => l.pick(["密码错误，请重试", "密碼錯誤，請重試", "Incorrect password. Try again."]).to_string(),
@@ -2578,9 +2659,27 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     }
                     Effect::Unlock { user, code } => {
                         ensure!(decryptor.is_none(), "the data partition is being opened already");
-                        let job = decrypt::Job::Unlock { closed: closed.clone(), user, credential: code.into_bytes() };
+                        let job = decrypt::Job::Unlock { closed: closed.clone(), user, credential: code.clone().into_bytes() };
                         decryptor = Some(Decryptor::start(job)?);
+                        // Kept only once it opens: what a phone is given that
+                        // it turns down is not a credential to write down.
+                        unlock_typed = Some((user, code));
+                        unlock_auto = false;
                     }
+                    Effect::RememberPassword(code) => match code {
+                        Some(credential) => match crate::remembered::save(&credential) {
+                            Ok(()) => app.state.remembered = Some(credential),
+                            Err(e) => {
+                                let _ = skyward_sys::kmsg(&format!("the credential is not kept: {e:#}"));
+                            }
+                        },
+                        None => {
+                            app.state.remembered = None;
+                            if let Err(e) = crate::remembered::forget() {
+                                let _ = skyward_sys::kmsg(&format!("the kept credential is not removed: {e:#}"));
+                            }
+                        }
+                    },
                     Effect::ReadDir(folder) => list(&mut app, folder, &closed)?,
                     Effect::ReadPlace(place, folder) => list_place(&mut app, place, folder)?,
                     // A name taken where an entry goes is the user's to

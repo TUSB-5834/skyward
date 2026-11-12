@@ -21,6 +21,10 @@ pub mod ramdisk {
     /// which Skyward puts in that system's init_boot image: linked
     /// statically, since it runs before any system's libraries are there.
     pub const SYSTEM_INIT: &str = "skyward/system-init";
+    /// Bash is static so scripts can run after the system partitions leave.
+    pub const BASH: &str = "system/bin/bash";
+    pub const BASH_LINK: &str = "sbin/bash";
+    pub const BASH_LICENSE: &str = "system/etc/bash/COPYING";
     /// The commands install scripts written for other recoveries run that
     /// Skyward answers itself: 7za, avbctl, resetprop and zstd, which a
     /// stock recovery does not carry, and unzip, whose stock version holds
@@ -215,6 +219,13 @@ pub struct Haptics {
     /// driver plays the waveforms it keeps.
     #[serde(default)]
     pub click: Option<i16>,
+    /// Raw signed 8-bit RTP samples read from the installed system. When
+    /// present this replaces the driver's numbered click waveform.
+    #[serde(default)]
+    pub click_rtp: Option<Rtp>,
+    /// An optional RTP waveform for the power-key screen-off feedback.
+    #[serde(default)]
+    pub ticks_rtp: Option<Rtp>,
     /// The file the motor's driver says its resonant frequency in, in
     /// tenths of a hertz whatever its label, on phones whose click is made
     /// for the motor's own frequency. A driver that says it nowhere, as
@@ -233,6 +244,14 @@ pub struct Haptics {
     #[serde(default)]
     pub firmware: Vec<Firmware>,
     pub strength: Strength,
+}
+
+/// A file of samples and its explicit playback rate. The rate cannot be
+/// recovered from a headerless RTP file, so it belongs in the device config.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Rtp {
+    pub path: String,
+    pub rate: u32,
 }
 
 /// The panel's own doze: what the display driver is told to keep a little of
@@ -681,6 +700,11 @@ impl DeviceConfig {
             ensure!(!aod.leave_cmds.is_empty(), "[aod] leave_cmds names no command set that brings the panel back out");
         }
         if let Some(haptics) = &cfg.haptics {
+            ensure!(haptics.click.is_none() || haptics.click_rtp.is_none(), "[haptics] choose click or click_rtp, not both");
+            for rtp in [&haptics.click_rtp, &haptics.ticks_rtp].into_iter().flatten() {
+                ensure!(Path::new(&rtp.path).has_root(), "[haptics] RTP path must be absolute: {}", rtp.path);
+                ensure!(matches!(rtp.rate, 8000 | 24000), "[haptics] RTP rate must be 8000 or 24000 Hz");
+            }
             // A click is either a waveform the driver keeps or one made at
             // the motor's own frequency, and a phone may name the frequency
             // beside a kept waveform too, for the ticks the screen going off
@@ -838,6 +862,18 @@ mod tests {
             let s = format!("{resonance}\nstrength = {{ lightest = {lightest:?}, strongest = {strongest:?} }}");
             assert!(with(&s).is_err(), "{lightest} to {strongest} is refused");
         }
+    }
+
+    #[test]
+    fn rtp_feedback_requires_a_path_rate_and_unambiguous_click() {
+        let with = |body: &str| DeviceConfig::parse(&format!("[device]\ncodename = \"x\"\n[haptics]\nstrength = {{ lightest = 0.25, strongest = 0.5 }}\n{body}\n"));
+        let rtp = "click_rtp = { path = \"/odm/firmware/0_click_P_RTP.bin\", rate = 24000 }";
+        assert!(with(rtp).is_ok());
+        assert!(with(&format!("{rtp}\nticks_rtp = {{ path = \"/odm/firmware/1_doubelClick_P_RTP.bin\", rate = 24000 }}")).is_ok());
+        assert!(with(&format!("click = 0\n{rtp}")).is_err());
+        assert!(with(&rtp.replace("/odm/", "odm/")).is_err());
+        assert!(with(&rtp.replace("24000", "0")).is_err());
+        assert!(with(&rtp.replace("24000", "8000")).is_ok());
     }
 
     #[test]

@@ -7,6 +7,7 @@
 use crate::adb::{self, Connection, Offer, Service};
 use crate::asked::Asked;
 use crate::blockmap::BlockMap;
+use crate::engine::{engine_lines, wait_engine};
 use crate::ffs::{Endpoints, Shared, Usb};
 use crate::fuse::{self, Fault, LocalFile, Mount, Name};
 use crate::image::{self, ImageKind};
@@ -15,7 +16,7 @@ use crate::ota::{self, Log, Status};
 use crate::package::{self, Build, Package, Phone, Update};
 use crate::script::{self, Bar, Request};
 use crate::signature::{self, Verdict};
-use crate::{Command, Event, Failure, Options, Outcome, Reflash, Refusal, Stage, ENGINE_LOG, SCRIPT_LOG};
+use crate::{Avb, Command, Event, Failure, Options, Outcome, Reflash, Refusal, Stage, ENGINE_LOG, SCRIPT_LOG};
 use anyhow::{anyhow, bail, ensure, Context as _, Result};
 use skyward_sys::{kmsg, prop};
 use skyward_vab::{Slot, SlotMaps, SnapshotState};
@@ -27,6 +28,7 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -40,9 +42,9 @@ pub type Detach = Box<dyn FnOnce() -> Result<()> + Send>;
 const METADATA: &str = "/metadata";
 const DATA: &str = "/data";
 
-/// Where a zip's install script is put to run, as Android's recovery puts
-/// it, and the version of the interface the script is told it runs under.
-const BINARY: &str = "/tmp/update-binary";
+/// Keep the install script outside /tmp, which ROM scripts may clear.
+/// The interface version is the one Android recovery hands its updater.
+const BINARY: &str = "/skyward/run/update-binary";
 const API_VERSION: &str = "3";
 const RETRY: &str = "retry";
 
@@ -649,6 +651,17 @@ fn update_system<S>(ctx: &mut Context, mount: &Mount<S>, update: &Update) -> Res
             if let Some(kept) = &kept {
                 reflash(ctx, kept, Ok(slot.other()));
             }
+            // An update package installs to the other slot and switches to
+            // it, so that is where the checks have to come off for the new
+            // system to start. As with a script, the system asking for the
+            // update is not the owner asking for this.
+            if ctx.options.disable_avb && !matches!(ctx.origin, Origin::Asked { .. }) {
+                // The screen is told either way; an update that went in is
+                // not failed over the checks being left on.
+                if let Err(e) = post_avb(ctx, Ok(slot.other())) {
+                    let _ = kmsg(&format!("install: the AVB checks are not written: {e:#}"));
+                }
+            }
             Done::Decided(Outcome::Installed { slot: slot.other(), wipe })
         }
         code => Done::Engine(code),
@@ -748,23 +761,26 @@ fn apply<S>(ctx: &Context, mount: &Mount<S>, update: &Update) -> Result<i32> {
             Ok(())
         });
     }
+    let mut log = File::create(ENGINE_LOG).with_context(|| format!("create {ENGINE_LOG}"))?;
     let mut child = command.spawn().with_context(|| format!("start {}", ota::PROGRAM))?;
+    drop(command);
     drop(status_write);
     let stderr = child.stderr.take().expect("stderr is piped");
-    let mut log = File::create(ENGINE_LOG).with_context(|| format!("create {ENGINE_LOG}"))?;
-
+    let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
     let status_tx = tx.clone();
+    let status_stop = stop.clone();
     let status = thread::spawn(move || {
-        lines(File::from(status_read), |line| {
+        engine_lines(File::from(status_read), &status_stop, |line| {
             if let Some(s) = ota::status(line) {
                 let _ = status_tx.send(Line::Status(s));
             }
             Ok(())
         })
     });
+    let log_stop = stop.clone();
     let logged = thread::spawn(move || {
-        lines(stderr, |line| {
+        engine_lines(stderr, &log_stop, |line| {
             if let Some(l) = ota::log(line) {
                 let _ = tx.send(Line::Log(l));
             }
@@ -772,28 +788,33 @@ fn apply<S>(ctx: &Context, mount: &Mount<S>, update: &Update) -> Result<i32> {
         })
     });
 
-    let total = update.payload_size;
-    let mut stage = Stage::Writing { done: 0, total };
+    // FUSE's highest read offset already reaches the ZIP directory at the
+    // end of the package before any update is applied. Only the engine's
+    // own progress describes work, never how far someone sought in the ZIP.
+    let mut progress = None;
+    let mut stage = Stage::Writing { done: 0, total: 0 };
     ctx.send(Event::Progress(stage.clone()));
     let mut told = Instant::now();
     let (mut partitions, mut verifying, mut finishing, mut error) = (0, None, false, None);
-    loop {
-        match rx.recv_timeout(PROGRESS_EVERY) {
-            Ok(Line::Status(Status::Step(step))) => finishing = step == 2,
-            Ok(Line::Status(Status::Error(code))) => error = Some(code),
-            Ok(Line::Log(Log::Partition(_))) => partitions += 1,
-            Ok(Line::Log(Log::Overwriting)) => ctx.send(Event::Overwriting),
-            Ok(Line::Log(Log::Hashing { index, partition })) => verifying = Some((index, partition)),
-            Err(RecvTimeoutError::Timeout) => {}
-            // Both outputs closed: the program has ended.
-            Err(RecvTimeoutError::Disconnected) => break,
+    let mut receive = |line| {
+        match line {
+            Line::Status(Status::Step(step)) => finishing = step == 2,
+            Line::Status(Status::Error(code)) => error = Some(code),
+            Line::Status(Status::Progress(value)) | Line::Log(Log::Progress(value)) => {
+                if !finishing && verifying.is_none() {
+                    progress = Some(progress.unwrap_or(0).max(value.min(999)));
+                }
+            }
+            Line::Log(Log::Partition(_)) => partitions += 1,
+            Line::Log(Log::Overwriting) => ctx.send(Event::Overwriting),
+            Line::Log(Log::Hashing { index, partition }) => verifying = Some((index, partition)),
         }
         let now = if finishing {
             Stage::Finishing
         } else if let Some((index, partition)) = &verifying {
             Stage::Verifying { index: *index, count: partitions.max(index + 1), partition: partition.clone() }
         } else {
-            Stage::Writing { done: mount.served().saturating_sub(update.payload_offset).min(total), total }
+            Stage::Writing { done: u64::from(progress.unwrap_or(0)), total: if progress.is_some() { 1000 } else { 0 } }
         };
         let moved_on = std::mem::discriminant(&now) != std::mem::discriminant(&stage);
         if now != stage && (moved_on || told.elapsed() >= PROGRESS_EVERY) {
@@ -801,10 +822,18 @@ fn apply<S>(ctx: &Context, mount: &Mount<S>, update: &Update) -> Result<i32> {
             ctx.send(Event::Progress(stage.clone()));
             told = Instant::now();
         }
-    }
-    let ended = child.wait().context("wait for update_engine")?;
+    };
+    let ended = wait_engine(&mut child, &rx, &mut receive);
+    // Only stop reading after the engine has exited (or waiting itself
+    // failed). Do not kill descendants: snapuserd may serve live snapshots.
+    stop.store(true, Ordering::Relaxed);
     status.join().expect("the status reader does not panic").context("read update_engine's status")?;
     logged.join().expect("the log reader does not panic").context("read update_engine's log")?;
+    for line in rx.try_iter() {
+        receive(line);
+    }
+    let ended = ended?;
+    kmsg(&format!("install: update_engine exited with {ended}; reported error {error:?}"))?;
     match (ended.code(), error) {
         (_, Some(code)) => Ok(code),
         (Some(code), None) => Ok(code),
@@ -914,7 +943,39 @@ fn run_script<S>(ctx: &mut Context, mount: &Mount<S>, size: u64) -> Result<Done>
         reflash(ctx, kept, skyward_vab::boot::next_slot().context("ask which slot starts next"));
     }
     let (code, wipe_cache) = ran?;
+    // A ROM flashed without the phone's keys will not start on a locked
+    // bootloader, so the checks go off after a script that ended cleanly, in
+    // the slot the phone will start from next. An install the system asked
+    // for never does this: no one is at the screen to have asked for it.
+    if code == 0 && ctx.options.disable_avb && !matches!(ctx.origin, Origin::Asked { .. }) {
+        // The package is written and the phone is otherwise ready: a check
+        // left on is something the owner can change from the AVB page, not a
+        // reason to call a finished install failed.
+        if let Err(e) = post_avb(ctx, skyward_vab::boot::next_slot().context("ask which slot the phone starts from next")) {
+            let _ = kmsg(&format!("install: the AVB checks are not written: {e:#}"));
+        }
+    }
     Ok(Done::Script { code, wipe_cache })
+}
+
+/// Turn both AVB checks off in `slot`, telling the screen what happened.
+///
+/// Failing does not fail the install: the package is written and the phone is
+/// otherwise ready, and a check left on is something the owner can change
+/// from the AVB page afterwards. What went wrong is said, so that a phone
+/// that will not start is not a mystery.
+fn post_avb(ctx: &mut Context, slot: Result<skyward_vab::Slot>) -> Result<()> {
+    let slot = match slot {
+        Ok(slot) => slot,
+        Err(e) => {
+            ctx.send(Event::Avb(Avb { slot: None, done: Err(format!("{e:#}")) }));
+            return Ok(());
+        }
+    };
+    let outcome = crate::commands::avbctl::disable_slot(slot).map_err(|e| format!("{e}"));
+    let done = outcome.map(|backup| backup.map(|b| b.display().to_string()));
+    ctx.send(Event::Avb(Avb { slot: Some(slot), done }));
+    Ok(())
 }
 
 /// Check the zip being served, `size` bytes, was signed with one of the
@@ -946,6 +1007,8 @@ fn extract_script<S>(mount: &Mount<S>) -> Result<()> {
         Err(e) if e.kind() == ErrorKind::NotFound => {}
         Err(e) => return Err(e).with_context(|| format!("take away the {BINARY} an earlier install left")),
     }
+    fs::create_dir_all(Path::new(BINARY).parent().expect("the script has a parent"))
+        .context("make the install script folder")?;
     let mut out = OpenOptions::new().write(true).create_new(true).open(BINARY).with_context(|| format!("make {BINARY}"))?;
     io::copy(&mut script, &mut out).with_context(|| format!("write {BINARY}"))?;
     out.set_permissions(fs::Permissions::from_mode(0o755)).with_context(|| format!("make {BINARY} runnable"))

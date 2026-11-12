@@ -198,10 +198,11 @@ version = "OS3.0.307.0.WOCCNXM"
 package = "https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com/OS3.0.307.0.WOCCNXM/dada-ota_full-OS3.0.307.0.WOCCNXM-user-16.0-135abb5f28.zip"
 recovery = "2efc22c0955b694cd5d8f44243e78f2e08d76d8011df0b9dc84de8b31d05334d"
 
-# qcom-hv-haptics keeps click waveform 0. On dada it plays for 23 ms and
-# gives stock-like feedback at 25% strength; the synthesized FIFO click
-# used before this did not. Retain that tested lower end of the slider.
+# Read Xiaomi's RTP waveforms from the running slot's ODM partition and
+# stream their samples through qcom-hv-haptics FF_CUSTOM. 24 kHz is the
+# initial device-test rate; the files themselves have no sample-rate header.
 [haptics]
-click = 0
+click_rtp = { path = "/odm/firmware/0_click_P_RTP.bin", rate = 24000 }
+ticks_rtp = { path = "/odm/firmware/1_doubelClick_P_RTP.bin", rate = 24000 }
 resonance = "/sys/class/qcom-haptics/lra_frequency_hz"
 strength = { lightest = 0.25, strongest = 0.5 }

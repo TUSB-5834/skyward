@@ -559,6 +559,10 @@ pub enum Switch {
     /// Write Skyward back into the recovery partitions an install writes
     /// over.
     KeepRecovery,
+    /// Turn both AVB checks off after a ROM is installed.
+    DisableAvb,
+    /// Remember the screen lock that opens the data partition.
+    RememberPassword,
     Wlan,
     /// Show the clock and the phone's readings on a dark panel, in the
     /// panel's own doze, rather than putting the panel out.
@@ -1595,6 +1599,8 @@ pub struct AvbStatus {
 /// stands.
 #[derive(Clone, Debug, PartialEq)]
 pub struct State {
+    /// Outcome of the optional post-install AVB step.
+    pub avb_notice: Option<String>,
     /// The language the pages speak.
     pub lang: Lang,
     /// The language was chosen on the language page, now or at an earlier
@@ -1652,6 +1658,19 @@ pub struct State {
     /// Skyward goes back into the recovery partitions an install writes
     /// over.
     pub keep_recovery: bool,
+    /// Turn both AVB checks off after a ROM is installed, so that a system
+    /// built without this phone's keys can start on a bootloader that
+    /// would otherwise refuse it. Off unless asked for: it is a change to
+    /// the signature the bootloader checks, not to what an install writes.
+    pub disable_avb: bool,
+    /// Remember the screen lock once it opens the data partition, and try
+    /// it by itself at the next start. Off unless asked for, because a
+    /// password kept on the phone is a password someone else may read.
+    pub remember_password: bool,
+    /// The last credential this phone accepted, where remembering is on.
+    /// Held so that the decrypt page can offer it, and dropped when it is
+    /// turned off or the phone forgets it.
+    pub remembered: Option<String>,
     /// How Skyward went back into the recovery partitions the install
     /// wrote over, where it did.
     pub reflash: Option<Reflash>,
@@ -1799,6 +1818,7 @@ pub struct State {
 impl Default for State {
     fn default() -> Self {
         State {
+            avb_notice: None,
             lang: Lang::Hans,
             language_chosen: false,
             dark: false,
@@ -1826,6 +1846,9 @@ impl Default for State {
             check_signature: false,
             recovery_partitions: false,
             keep_recovery: true,
+            disable_avb: false,
+            remember_password: false,
+            remembered: None,
             reflash: None,
             mounts: Ok(Vec::new()),
             mount_failure: None,
@@ -2036,6 +2059,8 @@ pub enum Shot {
 /// Work the runtime carries out on the UI's behalf.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Effect {
+    /// Remember the screen lock just typed, or forget the one remembered.
+    RememberPassword(Option<String>),
     Reboot(Target),
     /// A short tap of the vibration motor.
     Haptic,
@@ -2337,6 +2362,9 @@ const TITLE_BLUR_DP: f32 = 25.0 / 3.0;
 const FOLD_FADE_DP: f32 = 26.0;
 const FOLD_SETTLE: f32 = 0.5;
 const FOLD_PERIOD: f32 = 0.354;
+/// Both screen edges accept an inward swipe within the outer 28 dp,
+/// stopping where the inset slider tracks begin.
+const BACK_EDGE_DP: f32 = 28.0;
 /// How far, in dp, a swipe from an edge has to come in to go back.
 const BACK_SWIPE_DP: f32 = 56.0;
 /// The back cue sits this far, in dp, above where the finger came down,
@@ -2748,6 +2776,10 @@ pub struct App {
     dither: Option<glow::Dither>,
     toast: Option<(String, u64)>,
     drag: Drag,
+    /// Last strength preview, spaced so a full RTP click can play out.
+    slider_feedback: Option<(u64, f32)>,
+    /// Which list end has already clicked during this pull: -1 top, 1 bottom.
+    boundary_feedback: i8,
     tracker: Tracker,
     /// The page gliding on after a flick.
     fling: Option<Fling>,
@@ -2868,6 +2900,8 @@ impl App {
             dither: None,
             toast: None,
             drag: Drag::Idle,
+            slider_feedback: None,
+            boundary_feedback: 0,
             tracker: Tracker::default(),
             fling: None,
             glide: None,
@@ -3111,6 +3145,9 @@ impl App {
                 let period = if speed.abs() <= self.theme().m.dp(HARD_BOUNCE_DP) { 0.4 } else { 0.55 };
                 self.bounce = Some(Spring::new(now, 0.0, speed, period));
                 self.fling = None;
+                if self.state.vibrate && self.display_on {
+                    fx.push(Effect::Haptic);
+                }
             } else if done {
                 self.fling = None;
                 self.settle_fold(now);
@@ -3381,6 +3418,39 @@ impl App {
     /// Something laid over the page changed (the clock): compose again.
     pub fn redraw(&mut self) {
         self.dirty = true;
+    }
+
+    /// The credential to try by itself at this start, where the owner's
+    /// files are still shut and one was kept for them: what the decrypt
+    /// page would have been asked for, taken without asking. `owner_shut`
+    /// says the phone's files did not open with nothing known, which is
+    /// the only case a credential is any use in.
+    pub fn auto_attempt(&self, owner_shut: bool) -> Option<String> {
+        if !self.state.remember_password || !owner_shut {
+            return None;
+        }
+        self.state.remembered.clone()
+    }
+
+    /// The kept credential was refused, so it is not the phone's any more:
+    /// a credential left behind after a password change would be tried and
+    /// refused at every start.
+    pub fn forget_password(&mut self) -> Vec<Effect> {
+        self.state.remembered = None;
+        vec![Effect::RememberPassword(None)]
+    }
+
+    /// A credential that opened the phone's files, to be written down
+    /// where the owner asked for it to be kept.
+    pub fn keep_password(&mut self, code: String) -> Vec<Effect> {
+        self.state.remembered = Some(code.clone());
+        vec![Effect::RememberPassword(Some(code))]
+    }
+
+    /// What an earlier start kept, for the decrypt page to offer.
+    pub fn remembered(&mut self, code: Option<String>) {
+        self.state.remembered = code;
+        self.refresh();
     }
 
     /// The settings the pages show, as they are kept between starts.
@@ -4290,7 +4360,14 @@ impl App {
             let screen = self.screen();
             for rows in std::mem::take(&mut self.stale) {
                 let band = Band { rows, cols: (0, self.cols) };
-                let cx = Ctx { t: &t, f, info, state: &self.state, term: self.term.as_ref(), band: Some(band) };
+                let cx = Ctx {
+                    t: &t,
+                    f,
+                    info,
+                    state: &self.state,
+                    term: self.term.as_ref(),
+                    band: Some(band),
+                };
                 let fresh = pages::render(screen, &cx);
                 let mut canvas = self.frame.take().expect("checked above").canvas;
                 assert_eq!(canvas.h, fresh.canvas.h, "a page drawn again in part is as tall as it was");
@@ -4303,7 +4380,14 @@ impl App {
             let screen = self.screen();
             let first = self.top().1.max(0.0) as u32;
             let band = Band { rows: (first, first + self.h), cols: (0, wide.min(self.w)) };
-            let cx = Ctx { t: &t, f, info, state: &self.state, term: self.term.as_ref(), band: Some(band) };
+            let cx = Ctx {
+                    t: &t,
+                    f,
+                    info,
+                    state: &self.state,
+                    term: self.term.as_ref(),
+                    band: Some(band),
+                };
             let mut frame = pages::render(screen, &cx);
             // A page drawn in part across holds its rows whole, the columns
             // of them drawn on as they are needed.
@@ -4364,7 +4448,14 @@ impl App {
         let held = frame.canvas.held();
         let t = self.theme();
         let band = Band { rows: (held.start, held.end), cols: (self.cols, wide) };
-        let cx = Ctx { t: &t, f, info, state: &self.state, term: self.term.as_ref(), band: Some(band) };
+        let cx = Ctx {
+                    t: &t,
+                    f,
+                    info,
+                    state: &self.state,
+                    term: self.term.as_ref(),
+                    band: Some(band),
+                };
         let part = pages::render(self.screen(), &cx).canvas;
         self.frame.as_mut().expect("drawn above").canvas.replace(&part);
         self.cols = wide;
@@ -4395,7 +4486,14 @@ impl App {
         let screen = self.screen();
         for rows in bands {
             let band = Band { rows, cols: (0, self.w) };
-            let cx = Ctx { t: &t, f, info, state: &self.state, term: self.term.as_ref(), band: Some(band) };
+            let cx = Ctx {
+                    t: &t,
+                    f,
+                    info,
+                    state: &self.state,
+                    term: self.term.as_ref(),
+                    band: Some(band),
+                };
             let part = pages::render(screen, &cx).canvas;
             self.frame.as_mut().expect("drawn above").canvas.join(&part);
         }
@@ -5292,7 +5390,10 @@ impl App {
         let install = &mut self.state.install;
         match ev {
             Event::Waiting => *install = Install::Waiting,
-            Event::Checking { size } => *install = Install::Checking { size, stage: None },
+            Event::Checking { size } => {
+                self.state.avb_notice = None;
+                *install = Install::Checking { size, stage: None };
+            },
             Event::Ready { version, wipe } => *install = Install::Confirming { version, wipe },
             Event::Installing { version } => *install = Install::Updating { version, stage: None, overwriting: false },
             Event::Overwriting => {
@@ -5325,6 +5426,29 @@ impl App {
                 _ => {}
             },
             Event::Reflashed(reflash) => self.state.reflash = Some(reflash),
+            Event::Avb(avb) => {
+                // What the install's own AVB step did, said where the install
+                // says how it went. A phone whose checks were left on because
+                // this failed is the one the owner has to know about.
+                let slot = avb.slot.map(|s| s.letter()).unwrap_or("?");
+                let said = match avb.done {
+                    Ok(None) => tr!(self.state.lang, "{slot} 槽的 AVB 校验本来就是关闭的", "{slot} 槽的 AVB 驗證本來就是關閉的", "The AVB checks of slot {slot} were already off"),
+                    Ok(Some(backup)) => tr!(
+                        self.state.lang,
+                        "{slot} 槽的 AVB 校验已关闭，重启后生效。原镜像备份：{backup}",
+                        "{slot} 槽的 AVB 驗證已停用，重新啟動後生效。原映像檔備份：{backup}",
+                        "The AVB checks of slot {slot} are off, from the next start. The image as it was is kept at {backup}"
+                    ),
+                    Err(why) => tr!(
+                        self.state.lang,
+                        "自动禁用 {slot} 槽的 AVB 校验失败：{why}",
+                        "自動停用 {slot} 槽的 AVB 驗證失敗：{why}",
+                        "Automatically disabling the AVB checks of slot {slot} failed: {why}"
+                    ),
+                };
+                self.state.avb_notice = Some(said);
+                self.refresh();
+            }
             Event::Wipe | Event::Reboot(_) => unreachable!("the runtime carries out what rescue asks of it"),
             Event::Done(outcome) | Event::Finished(outcome) => {
                 let damage = match (&outcome, &*install) {
@@ -5473,6 +5597,8 @@ impl App {
                     Switch::Verify => &mut self.state.verify,
                     Switch::Signature => &mut self.state.check_signature,
                     Switch::KeepRecovery => &mut self.state.keep_recovery,
+                    Switch::DisableAvb => &mut self.state.disable_avb,
+                    Switch::RememberPassword => &mut self.state.remember_password,
                     Switch::ShowPassword => &mut self.state.show_password,
                     Switch::AlwaysOn => &mut self.state.always_on,
                     Switch::DoubleTap => &mut self.state.double_tap,
@@ -5480,6 +5606,9 @@ impl App {
                 };
                 *on = !*on;
                 let now_on = *on;
+                if switch == Switch::RememberPassword && !now_on {
+                    self.state.remembered = None;
+                }
                 if switch == Switch::DoubleTap {
                     self.tapped = None;
                     self.dark_touch = None;
@@ -5487,6 +5616,13 @@ impl App {
                 self.refresh();
                 if switch == Switch::FileTransfer {
                     return vec![Effect::FileTransfer(now_on)];
+                }
+                // Turning remembering off has to take the sealed file away,
+                // not only the copy the pages hold: a credential left on the
+                // phone after the switch was turned off is the one thing the
+                // switch promises not to do.
+                if switch == Switch::RememberPassword && !now_on {
+                    return vec![Effect::RememberPassword(None)];
                 }
             }
             Action::MountToggle(i) => {
@@ -6334,12 +6470,14 @@ impl App {
         self.stir(now);
         let t = self.theme();
         let m = t.m;
-        let (slop, edge) = (m.dp(8.0), m.dp(20.0));
+        let (slop, edge) = (m.dp(8.0), m.dp(BACK_EDGE_DP));
         let scroll = self.top().1;
         let mut fx = Vec::new();
         let pressing = self.pressing();
         match ev {
             Touch::Down(x, y) => {
+                self.slider_feedback = None;
+                self.boundary_feedback = 0;
                 self.tracker.clear();
                 self.tracker.add(now, y);
                 let side = if x < edge {
@@ -6409,6 +6547,7 @@ impl App {
                 self.drag = match hit {
                     Some((Action::Slider(which), track)) => {
                         self.set_slider(&t, which, track, x);
+                        self.preview_strength(which, now, false, &mut fx);
                         Drag::Slider(which, track)
                     }
                     Some((Action::Confirm(which), track)) if self.on_knob(track, x) => {
@@ -6440,6 +6579,12 @@ impl App {
                             fx.extend(click.then_some(Effect::Haptic));
                             edge
                         }
+                        // A side swipe can start with a little vertical
+                        // drift. Keep it undecided until it moves inward or
+                        // clearly scrolls, so a list's end cannot take it.
+                        Some(from_left) if dy.abs() <= slop * 2.0 && (if from_left { dx } else { -dx }) >= -slop => {
+                            Drag::Press { x: x0, y: y0, action, edge: at_edge, at }
+                        }
                         _ if dy.abs() > slop => {
                             let history = self.frame.as_ref().and_then(|fr| fr.scrollback).filter(|(r, _)| r.contains(x0, y0 + scroll));
                             if let Some((_, pitch)) = history {
@@ -6449,7 +6594,7 @@ impl App {
                                 // caught where it has got to; one at rest
                                 // follows the finger from where it came down.
                                 if !self.catch(now) {
-                                    self.drag_by(y0 - y);
+                                    self.drag_with_feedback(y0 - y, &mut fx);
                                 }
                                 Drag::Scroll { last: y }
                             }
@@ -6463,7 +6608,7 @@ impl App {
                 }
                 Drag::Scroll { last } => {
                     self.tracker.add(now, y);
-                    self.drag_by(last - y);
+                    self.drag_with_feedback(last - y, &mut fx);
                     self.drag = Drag::Scroll { last: y };
                 }
                 Drag::Edge { start, from_left, armed, cy, .. } => {
@@ -6473,6 +6618,7 @@ impl App {
                 }
                 Drag::Slider(which, track) => {
                     self.set_slider(&t, which, track, x);
+                    self.preview_strength(which, now, false, &mut fx);
                     self.drag = Drag::Slider(which, track);
                 }
                 Drag::Confirm { which, track, grab } => {
@@ -6559,9 +6705,9 @@ impl App {
                     }
                 }
                 Drag::Pattern => fx.extend(self.drawn(now)),
-                // Let go, the strength slider taps the motor as strongly as
-                // it was left at.
-                Drag::Slider(Slider::Vibration, _) if self.state.vibrate => fx.push(Effect::Haptic),
+                // Preview the final strength if it has not played during
+                // the drag, without repeating the same preview on release.
+                Drag::Slider(Slider::Vibration, _) => self.preview_strength(Slider::Vibration, now, true, &mut fx),
                 _ => {}
             },
         }
@@ -6872,6 +7018,7 @@ impl App {
             Confirm::DeleteEntry => fx.push(Effect::Delete(self.entry_path())),
             // The partition has to be open; whether its users have unlocked
             // their own files makes no difference.
+
             Confirm::Relabel => match self.state.data {
                 Data::Open | Data::Locked { .. } => fx.push(Effect::Relabel),
                 Data::Opening => self.say(l.pick(DATA_OPENING), now),
@@ -7297,6 +7444,31 @@ impl App {
         x >= knob_x && x <= knob_x + track.h
     }
 
+    fn drag_with_feedback(&mut self, distance: f32, fx: &mut Vec<Effect>) {
+        let max = self.max_scroll();
+        self.drag_by(distance);
+        let offset = self.top().1;
+        let end = if offset <= 0.0 { -1 } else if offset >= max { 1 } else { 0 };
+        if max > 0.0 && distance != 0.0 && end != 0 && end != self.boundary_feedback && self.state.vibrate {
+            fx.push(Effect::Haptic);
+        }
+        self.boundary_feedback = end;
+    }
+
+    fn preview_strength(&mut self, which: Slider, now: u64, released: bool, fx: &mut Vec<Effect>) {
+        if which != Slider::Vibration || !self.state.vibrate {
+            return;
+        }
+        let level = self.state.vibration;
+        let due = self.slider_feedback.is_none_or(|(at, previous)| {
+            (level - previous).abs() >= 0.02 && (released || now.saturating_sub(at) >= 100)
+        });
+        if due {
+            self.slider_feedback = Some((now, level));
+            fx.push(Effect::Haptic);
+        }
+    }
+
     fn set_slider(&mut self, t: &Theme, which: Slider, track: Rect, x: f32) {
         self.set_level(t, which, track, (x - track.x) / track.w);
     }
@@ -7629,13 +7801,14 @@ mod tests {
     }
 
     #[test]
-    fn a_touch_dragged_off_a_button_does_not_click_or_open_it() {
+    fn a_touch_dragged_off_a_button_does_not_activate_it() {
         let (f, i) = (fonts(), info());
         for (dx, dy) in [(120.0, 0.0), (0.0, 120.0)] {
             let mut app = App::new(Screen::Home, W, H, PPD);
             let (x, y) = spot(&mut app, &f, &i, Action::Open(Screen::Settings));
             assert!(app.touch(Touch::Down(x, y), &f, 1000).is_empty());
-            assert!(app.touch(Touch::Move(x + dx, y + dy), &f, 1100).is_empty());
+            let expected = if dy > 0.0 { vec![Effect::Haptic] } else { vec![] };
+            assert_eq!(app.touch(Touch::Move(x + dx, y + dy), &f, 1100), expected, "only reaching the list's top gives feedback");
             assert!(app.touch(Touch::Up, &f, 1200).is_empty());
             assert_eq!(app.screen(), Screen::Home);
         }
@@ -7679,6 +7852,83 @@ mod tests {
             app.compose(&mut c, &f, &i, "12:00", 6000);
             assert!(app.turn.is_none());
             assert_eq!(app.snapshots.len(), 1, "the child's cached page is released");
+        }
+    }
+
+    #[test]
+    fn side_back_waits_for_direction_before_scrolling_or_clicking_a_list_end() {
+        let (f, i) = (fonts(), info());
+        for from_left in [true, false] {
+            let mut app = App::new(Screen::Home, W, 1200, PPD);
+            app.set_screen_corners(140.0);
+            let mut c = Canvas::new(W, 1200);
+            app.compose(&mut c, &f, &i, "12:00", 0);
+            tap_at(&mut app, &f, &i, Action::Open(Screen::Settings), 1000);
+            app.compose(&mut c, &f, &i, "12:00", 3000);
+            assert_eq!(app.screen(), Screen::Settings);
+            assert!(app.max_scroll() > 0.0);
+            let start = if from_left { 10.0 } else { W as f32 - 10.0 };
+            let x = |travel: f32| if from_left { start + travel } else { start - travel };
+            app.touch(Touch::Down(start, 700.0), &f, 4000);
+            assert!(app.touch(Touch::Move(x(8.0), 733.0), &f, 4008).is_empty(), "initial vertical drift is not a list boundary gesture");
+            assert_eq!(app.touch(Touch::Move(x(400.0), 740.0), &f, 4024), vec![Effect::Haptic]);
+            assert!(app.preview.is_some(), "the page follows the inward swipe");
+            assert_eq!(app.slid(4024).unwrap().0, 400);
+            app.compose(&mut c, &f, &i, "12:00", 4024);
+            assert!(app.touch(Touch::Up, &f, 4040).is_empty());
+            assert_eq!(app.screen(), Screen::Home);
+            assert_eq!(app.slid(4040).unwrap().0, 400, "return continues from the finger's position");
+        }
+    }
+
+    #[test]
+    fn side_back_can_be_repeated_after_returns_and_cancelled_previews() {
+        let (f, i) = (fonts(), info());
+        let (mut app, mut c) = preview_app(&f, &i);
+        for round in 0..6 {
+            let at = 4000 + round * 4000;
+            let start = if round % 2 == 0 { 10.0 } else { W as f32 - 10.0 };
+            let x = |travel: f32| if round % 2 == 0 { start + travel } else { start - travel };
+            app.touch(Touch::Down(start, 1600.0), &f, at);
+            app.touch(Touch::Move(x(100.0), 1600.0), &f, at + 16);
+            assert!(app.preview.is_some(), "round {round} starts a preview");
+            app.touch(Touch::Up, &f, at + 24);
+            assert_eq!(app.screen(), Screen::Mount);
+            app.compose(&mut c, &f, &i, "12:00", at + 32);
+            app.touch(Touch::Down(start, 1600.0), &f, at + 48);
+            assert_eq!(app.touch(Touch::Move(x(400.0), 1600.0), &f, at + 64), vec![Effect::Haptic]);
+            assert!(app.preview.is_some(), "a cancelled preview does not block the next swipe");
+            app.touch(Touch::Up, &f, at + 80);
+            assert_eq!(app.screen(), Screen::Home, "round {round} returns");
+            app.compose(&mut c, &f, &i, "12:00", at + 100);
+            app.compose(&mut c, &f, &i, "12:00", at + 2000);
+            tap_at(&mut app, &f, &i, Action::Open(Screen::Mount), at + 2100);
+            app.compose(&mut c, &f, &i, "12:00", at + 2100);
+            app.compose(&mut c, &f, &i, "12:00", at + 3900);
+            assert_eq!(app.screen(), Screen::Mount);
+        }
+    }
+
+    #[test]
+    fn both_side_edges_accept_a_slightly_inset_start_at_dada_size() {
+        let (f, i) = (fonts(), info());
+        let (w, h, density) = (1200, 2670, 520.0 / 160.0);
+        for from_left in [true, false] {
+            let mut app = App::new(Screen::Home, w, h, density);
+            let mut c = Canvas::new(w, h);
+            app.compose(&mut c, &f, &i, "12:00", 0);
+            tap_at(&mut app, &f, &i, Action::Open(Screen::Settings), 1000);
+            app.compose(&mut c, &f, &i, "12:00", 3000);
+            assert_eq!(app.screen(), Screen::Settings);
+            let inset = app.theme().m.dp(24.0);
+            let start = if from_left { inset } else { w as f32 - inset };
+            let target = if from_left { start + 400.0 } else { start - 400.0 };
+            app.touch(Touch::Down(start, 1600.0), &f, 4000);
+            app.touch(Touch::Move(target, 1605.0), &f, 4016);
+            assert!(app.preview.is_some(), "{from_left:?}: both edges recognize an inset inward swipe");
+            assert_eq!(app.slid(4016).unwrap().0, 400);
+            app.touch(Touch::Up, &f, 4032);
+            assert_eq!(app.screen(), Screen::Home);
         }
     }
 
@@ -8603,6 +8853,39 @@ mod tests {
     }
 
     #[test]
+    fn installing_a_rom_honours_the_avb_switch_and_it_is_saved() {
+        let mut app = App::new(Screen::Install, W, H, PPD);
+        assert!(!app.state.disable_avb, "a ROM is installed without turning the checks off");
+        assert!(app.act(Action::Toggle(Switch::DisableAvb), 1000).is_empty());
+        assert!(app.state.disable_avb);
+        let saved = crate::settings::Settings::read(&app.settings().text()).unwrap();
+        let mut next = State::default();
+        saved.apply(&mut next);
+        assert!(next.disable_avb, "and the choice is kept for the next start");
+    }
+
+    #[test]
+    fn turning_remembering_off_forgets_the_credential_it_held() {
+        let mut app = App::new(Screen::Settings, W, H, PPD);
+        app.state.remember_password = true;
+        app.state.remembered = Some("1234".into());
+        assert_eq!(app.auto_attempt(true).as_deref(), Some("1234"));
+        assert!(app.auto_attempt(false).is_none(), "an open owner needs no credential");
+        let saved = crate::settings::Settings::read(&app.settings().text()).unwrap();
+        let mut next = State::default();
+        saved.apply(&mut next);
+        assert!(next.remember_password);
+        assert!(next.remembered.is_none(), "the ordinary settings file holds no credential");
+        // Off: what was held is dropped, and the runtime is told to take the
+        // sealed file away with it.
+        assert_eq!(app.act(Action::Toggle(Switch::RememberPassword), 1000), vec![Effect::RememberPassword(None)]);
+        assert!(app.state.remembered.is_none(), "the credential goes with the switch");
+        assert!(!app.state.remember_password);
+        app.state.remembered = Some("stale".into());
+        assert!(app.auto_attempt(true).is_none(), "a stale credential cannot bypass the off switch");
+    }
+
+    #[test]
     fn scrolling_back_down_past_the_top_pulls_from_the_top() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Settings, W, H, PPD);
@@ -8916,14 +9199,15 @@ mod tests {
     }
 
     #[test]
-    fn the_strength_slider_taps_the_motor_as_strongly_as_it_is_let_go() {
+    fn strength_slider_previews_during_drag_and_respects_vibration_switch() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Settings, W, H, PPD);
         let track = app.frame(&f, &i).hits.iter().find(|h| h.action == Action::Slider(Slider::Vibration)).unwrap().rect;
         let y = track.centre().1 - app.top().1;
-        assert!(app.touch(Touch::Down(track.x + track.w * 0.25, y), &f, 0).is_empty());
-        assert!(app.touch(Touch::Move(track.x + track.w * 0.8, y + 40.0), &f, 0).is_empty(), "nothing taps while the finger moves");
-        assert_eq!(app.touch(Touch::Up, &f, 0), vec![Effect::Haptic], "let go, the motor taps");
+        assert_eq!(app.touch(Touch::Down(track.x + track.w * 0.25, y), &f, 1000),vec![Effect::Haptic]);
+        assert!(app.touch(Touch::Move(track.x + track.w * 0.5, y), &f, 1010).is_empty(), "fast moves wait for the current click");
+        assert_eq!(app.touch(Touch::Move(track.x + track.w * 0.8, y + 40.0), &f, 1120),vec![Effect::Haptic]);
+        assert!(app.touch(Touch::Up, &f, 1130).is_empty(), "the final level has already played");
         assert!((app.state.vibration - 0.8).abs() < 1e-5);
         assert!(app.touch(Touch::Down(track.x - 50.0, y), &f, 0).is_empty());
         assert!(app.touch(Touch::Up, &f, 0).is_empty(), "touched beside the track, the slider stays");
@@ -8931,6 +9215,38 @@ mod tests {
         app.touch(Touch::Down(track.x, y), &f, 0);
         assert!(app.touch(Touch::Up, &f, 0).is_empty(), "with touch vibration off, the motor stays still");
         assert_eq!(app.state.vibration, 0.0, "the strength still moves, down to the slider's left end");
+    }
+
+    #[test]
+    fn a_scroll_clicks_once_at_each_end_and_rearms_after_leaving_it() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Settings, W, 1200, PPD);
+        let _ = app.frame(&f, &i);
+        assert!(app.max_scroll() > 100.0);
+        app.top_mut().1 = 100.0;
+        let x = app.theme().m.margin / 2.0;
+        assert!(app.touch(Touch::Down(x, 700.0), &f, 1000).is_empty());
+        assert_eq!(app.touch(Touch::Move(x, 800.0), &f, 1120), vec![Effect::Haptic], "reaching exactly the top gives feedback");
+        assert!(app.touch(Touch::Move(x, 900.0), &f, 1200).is_empty());
+        assert!(app.touch(Touch::Move(x, 800.0), &f, 1240).is_empty(), "returning to the same boundary does not rearm it");
+        assert!(app.touch(Touch::Move(x, 810.0), &f, 1280).is_empty());
+        assert!(app.touch(Touch::Move(x, 600.0), &f, 1360).is_empty());
+        assert_eq!(app.touch(Touch::Move(x, 2000.0), &f, 1480), vec![Effect::Haptic]);
+        assert_eq!(app.touch(Touch::Move(x, -5000.0), &f, 1600), vec![Effect::Haptic]);
+        assert!(app.touch(Touch::Move(x, -5100.0), &f, 1720).is_empty());
+        app.state.vibrate = false;
+        assert!(app.touch(Touch::Move(x, 7000.0), &f, 1840).is_empty());
+    }
+
+    #[test]
+    fn a_fling_clicks_once_when_it_hits_a_list_end() {
+        let (f,i) = (fonts(),info());
+        let mut app = App::new(Screen::Settings,W,1200,PPD);
+        let _ = app.frame(&f,&i);
+        assert!(app.max_scroll()>0.0);
+        app.fling=Some(Fling::new(1000,app.max_scroll()-1.0,5000.0,160.0));
+        assert_eq!(app.tick(1050),vec![Effect::Haptic]);
+        assert!(app.tick(1060).is_empty());
     }
 
     #[test]
@@ -9877,14 +10193,21 @@ mod tests {
     #[test]
     fn every_unfinished_entry_now_opens_its_page() {
         let (f, i) = (fonts(), DeviceInfo { slot: Some(Slot::B), ..info() });
-        let routes: [(Screen, Screen); 13] = [
+        let routes: [(Screen, Screen); 17] = [
             (Screen::Home, Screen::Search),
             (Screen::Home, Screen::Backup),
             (Screen::Home, Screen::Restore),
             (Screen::Home, Screen::Advanced),
+            // Every row the Advanced page draws, which is the page whose last
+            // row was once drawn and given no action: it was there to touch
+            // and did nothing.
             (Screen::Advanced, Screen::Files),
             (Screen::Advanced, Screen::Terminal),
+            (Screen::Advanced, Screen::Relabel),
+            (Screen::Advanced, Screen::Filesystems),
             (Screen::Advanced, Screen::Logs),
+            (Screen::Advanced, Screen::Update),
+            (Screen::Advanced, Screen::Avb),
             (Screen::Settings, Screen::Language),
             (Screen::Settings, Screen::TimeZone),
             (Screen::Settings, Screen::Terminal),
